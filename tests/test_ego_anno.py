@@ -156,11 +156,12 @@ class ClientTests(unittest.TestCase):
             with mock.patch.object(client, "connect", return_value=conn), \
                  mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch("sys.stderr", new_callable=io.StringIO):
                 ego_anno.EgoAnnoClient("key").submit_stereo(
-                    str(video), str(video), str(calibration), method="stereo_sjcf", render=True)
+                    str(video), str(video), str(calibration), method="stereo_sjcf")
             body = b"".join(w[1] for w in conn.writes if w[0] == "send")
-            for name in (b'input_mode', b'left_video', b'right_video', b'calibration', b'hand_refinement_method', b'render'):
+            for name in (b'input_mode', b'left_video', b'right_video', b'calibration', b'hand_refinement_method'):
                 self.assertIn(b'name="' + name + b'"', body)
             self.assertNotIn(b'name="method"', body)
+            self.assertNotIn(b'name="render"', body)
 
     def test_wait_success_and_terminal_failure(self):
         job = "876c2588-abf5-4cb5-bca7-3da815d0c3b2"
@@ -202,6 +203,27 @@ class EntryPointTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("usage: ego-anno", result.stdout)
         self.assertNotIn("_ping", result.stdout)
+
+    def test_render_options_are_rejected(self):
+        for command, extra in (("submit", ["--video", "v.mp4", "--render"]),
+                               ("download", ["876c2588-abf5-4cb5-bca7-3da815d0c3b2", "--rendered", "v.mp4"])):
+            help_result = subprocess.run([sys.executable, "-m", "ego_anno", command, "--help"],
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual(help_result.returncode, 0)
+            self.assertNotIn("render", help_result.stdout)
+            result = subprocess.run([sys.executable, "-m", "ego_anno", command] + extra,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("unrecognized arguments", result.stderr)
+
+    def test_python_render_parameters_are_rejected(self):
+        api = ego_anno.EgoAnnoClient("key")
+        with self.assertRaises(TypeError):
+            api.submit_mono("video.mp4", render=True)
+        with self.assertRaises(TypeError):
+            api.submit_stereo("left.mp4", "right.mp4", "calibration.json", render=True)
+        with self.assertRaises(TypeError):
+            api.download("job", rendered="video.mp4")
 
     def test_console_entry_point_exists(self):
         executable = Path(sys.executable).with_name("ego-anno")

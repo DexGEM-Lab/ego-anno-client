@@ -9,19 +9,19 @@ the pin before sending your API key or video data.
 ## 1. Download and install the client
 
 Install Python 3.8+ with pip, preferably in a virtual environment. Get the
-released client from the public [v0.1.0 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.1.0).
+released client from the public [v0.1.1 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.1.1).
 Install its wheel directly (no Git checkout required):
 
 ```bash
-python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.1.0/ego_anno_client-0.1.0-py3-none-any.whl"
+python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.1.1/ego_anno_client-0.1.1-py3-none-any.whl"
 ego-anno --help
 ```
 
-Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.1.0/ego_anno_client-0.1.0-py3-none-any.whl)
+Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.1.1/ego_anno_client-0.1.1-py3-none-any.whl)
 from that Release and install the local file:
 
 ```bash
-python3 -m pip install ./ego_anno_client-0.1.0-py3-none-any.whl
+python3 -m pip install ./ego_anno_client-0.1.1-py3-none-any.whl
 ```
 
 If `ego-anno` is not on your PATH, use `python3 -m ego_anno` in its place.
@@ -49,11 +49,10 @@ ego-anno submit --video ./video.mp4
 Or submit synchronized stereo videos with calibration:
 
 ```bash
-ego-anno submit --left ./left.mp4 --right ./right.mp4 --calibration ./calibration.json --render
+ego-anno submit --left ./left.mp4 --right ./right.mp4 --calibration ./calibration.json
 ```
 
-`--render` requests the optional rendered MP4 and works for either input mode;
-omit it if you only need the annotation JSON. For stereo only, `--method` can
+For stereo only, `--method` can
 select `baseline`, `stereo_sj`, or `stereo_sjcf`; when omitted, the server
 chooses the default. Do not combine `--video` with stereo options.
 
@@ -96,17 +95,9 @@ After a successful wait, download the annotation:
 ego-anno download "$JOB_ID" -o annotation.json
 ```
 
-For a job submitted with `--render`, download both outputs:
-
-```bash
-ego-anno download "$JOB_ID" -o annotation.json --rendered rendered.mp4
-```
-
 `-o` defaults to `annotation.json`. Output directories must already exist.
-Each file is written to a temporary file and atomically moved into place after
-the complete response arrives, replacing an existing destination. The two
-files download separately: if the rendered download fails, the completed JSON
-remains on disk.
+The file is written to a temporary file and atomically moved into place after
+the complete response arrives, replacing an existing destination.
 
 ## Input requirements
 
@@ -150,9 +141,9 @@ valid UUIDs; invalid UUIDs exit with code `1`.
 from ego_anno import EgoAnnoClient
 
 client = EgoAnnoClient()  # reads EGO_ANNO_API_KEY
-job_id = client.submit_mono("./video.mp4", render=True)
+job_id = client.submit_mono("./video.mp4")
 client.wait(job_id)
-client.download(job_id, "annotation.json", rendered="rendered.mp4")
+client.download(job_id, "annotation.json")
 ```
 
 You can also pass `api_key=` explicitly. Stereo submission is available through

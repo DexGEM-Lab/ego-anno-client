@@ -20,12 +20,12 @@ class EgoAnnoClient:
         if any(char in self.api_key for char in "\r\n"):
             raise ClientError("API key contains an invalid character")
 
-    def submit_mono(self, video, render=False, idempotency_key=None, wait=False):
+    def submit_mono(self, video, idempotency_key=None, wait=False):
         """Submit one monocular video and return its annotation job ID."""
         files = [("video", video, mimetypes.guess_type(video)[0] or "video/mp4")]
-        return self._submit("mono", files, render, None, idempotency_key, wait)
+        return self._submit("mono", files, None, idempotency_key, wait)
 
-    def submit_stereo(self, left, right, calibration, method=None, render=False,
+    def submit_stereo(self, left, right, calibration, method=None,
                       idempotency_key=None, wait=False):
         """Submit synchronized stereo videos and calibration; return the job ID."""
         files = [
@@ -33,13 +33,11 @@ class EgoAnnoClient:
             ("right_video", right, mimetypes.guess_type(right)[0] or "video/mp4"),
             ("calibration", calibration, "application/json"),
         ]
-        return self._submit("stereo", files, render, method, idempotency_key, wait)
+        return self._submit("stereo", files, method, idempotency_key, wait)
 
-    def _submit(self, input_mode, files, render, method, idempotency_key, wait_for_result):
+    def _submit(self, input_mode, files, method, idempotency_key, wait_for_result):
         idem = str(uuid.UUID(idempotency_key)) if idempotency_key else str(uuid.uuid4())
         fields = [("input_mode", input_mode)]
-        if render:
-            fields.append(("render", "true"))
         if method:
             fields.append(("hand_refinement_method", method))
         body = Multipart(fields, files)
@@ -95,12 +93,10 @@ class EgoAnnoClient:
                     state, data.get("failure_code"), data.get("result_available")))
             time.sleep(interval)
 
-    def download(self, job_id, destination="annotation.json", rendered=None):
-        """Atomically download a result and, when requested, its rendered video."""
+    def download(self, job_id, destination="annotation.json"):
+        """Atomically download an annotation result."""
         path = job_path(job_id)
         download(path + "/result", destination, self.api_key)
-        if rendered:
-            download(path + "/rendered", rendered, self.api_key)
 
 
 def get_json(path, key):

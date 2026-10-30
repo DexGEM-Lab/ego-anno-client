@@ -37,7 +37,6 @@ def main(argv=None):
         sub.add_argument("--right")
         sub.add_argument("--calibration")
         sub.add_argument("--method", choices=("baseline", "stereo_sj", "stereo_sjcf"))
-        sub.add_argument("--render", action="store_true")
         sub.add_argument("--idempotency-key")
         sub.add_argument("--wait", action="store_true")
         status = commands.add_parser("status", help="show job status")
@@ -48,7 +47,6 @@ def main(argv=None):
         dl = commands.add_parser("download", help="download results")
         dl.add_argument("job_id")
         dl.add_argument("-o", default="annotation.json")
-        dl.add_argument("--rendered")
         args = parser.parse_args(arguments)
         if args.command == "submit":
             if args.video:
@@ -62,18 +60,18 @@ def main(argv=None):
         client = EgoAnnoClient(key)
         if args.command == "submit":
             if args.video:
-                client.submit_mono(args.video, render=args.render,
+                client.submit_mono(args.video,
                                    idempotency_key=args.idempotency_key, wait=args.wait)
             else:
                 client.submit_stereo(args.left, args.right, args.calibration, method=args.method,
-                                     render=args.render, idempotency_key=args.idempotency_key,
+                                     idempotency_key=args.idempotency_key,
                                      wait=args.wait)
         elif args.command == "status":
             print(json.dumps(client.status(args.job_id), indent=2))
         elif args.command == "wait":
             client.wait(args.job_id, args.interval)
         else:
-            client.download(args.job_id, args.o, args.rendered)
+            client.download(args.job_id, args.o)
         return 0
     except (ClientError, ValueError, KeyError, OSError, http.client.HTTPException) as exc:
         print("Error: {}".format(exc), file=sys.stderr)
