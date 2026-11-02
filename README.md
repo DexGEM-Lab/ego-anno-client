@@ -6,25 +6,45 @@ library. The service endpoint and server certificate SHA-256 pin are built in;
 no endpoint configuration, CA file, or CA flag is required. The client verifies
 the pin before sending your API key or video data.
 
+Two pipelines share the same account, API key, and credit balance:
+
+| | `dag` (default) | `e2e` |
+| --- | --- | --- |
+| Model | ego-anno annotation DAG | Cosmos3 hand147 end-to-end model |
+| Input | Mono video, or stereo videos + calibration | Mono video only |
+| Video limits | Up to 1800 frames per view at native fps and resolution | 15–30 fps, at most 20 s, short side 640–1440 px |
+| Local processing | None; the file is uploaded as-is | Resampled to 15 fps, first 17–241 frames kept, short side above 1080 px scaled to 1080 |
+| Extra inputs | `--method` (stereo only) | Optional `--prompt` and `--camera` intrinsics |
+| Billing | Whole seconds of video duration | `max(1, ceil(duration × 0.1))` seconds of the uploaded 15 fps clip |
+| Result | Annotation JSON | `cosmos-e2e-result/v1` JSON with 15 Hz camera motion and 147-D hand actions |
+| Needs | Python only | Python plus FFmpeg (`ffmpeg` and `ffprobe` on PATH) |
+
+The e2e billing ratio (default 0.1) is a deployment setting.
+
 ## 1. Download and install the client
 
 Install Python 3.8+ with pip, preferably in a virtual environment. Get the
-released client from the public [v0.1.1 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.1.1).
+released client from the public [v0.2.0 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.2.0).
 Install its wheel directly (no Git checkout required):
 
 ```bash
-python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.1.1/ego_anno_client-0.1.1-py3-none-any.whl"
+python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.2.0/ego_anno_client-0.2.0-py3-none-any.whl"
 ego-anno --help
 ```
 
-Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.1.1/ego_anno_client-0.1.1-py3-none-any.whl)
+Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.2.0/ego_anno_client-0.2.0-py3-none-any.whl)
 from that Release and install the local file:
 
 ```bash
-python3 -m pip install ./ego_anno_client-0.1.1-py3-none-any.whl
+python3 -m pip install ./ego_anno_client-0.2.0-py3-none-any.whl
 ```
 
 If `ego-anno` is not on your PATH, use `python3 -m ego_anno` in its place.
+
+The e2e pipeline additionally needs FFmpeg 4.4 or newer with libx264 (for
+example `sudo apt install ffmpeg` or `brew install ffmpeg`); the client runs
+the `ffprobe` and `ffmpeg` found on PATH and stops with an error if either is
+missing. The DAG pipeline does not use FFmpeg.
 
 ## 2. Configure your API key
 
@@ -40,7 +60,7 @@ Keep your key private; do not commit it to a repository.
 
 ## 3. Submit a video
 
-Choose one input mode. Submit a monocular video:
+Choose one input mode. Submit a monocular video to the default DAG pipeline:
 
 ```bash
 ego-anno submit --video ./video.mp4
@@ -56,6 +76,55 @@ For stereo only, `--method` can
 select `baseline`, `stereo_sj`, or `stereo_sjcf`; when omitted, the server
 chooses the default. Do not combine `--video` with stereo options.
 
+### e2e pipeline
+
+Submit a monocular video to the Cosmos3 hand147 model with `--pipeline e2e`:
+
+```bash
+ego-anno submit --video ./video.mp4 --pipeline e2e
+ego-anno submit --video ./video.mp4 --pipeline e2e \
+  --prompt "pick up the cup" --camera ./camera.json --wait
+```
+
+`--prompt` is an optional task description of 1–1000 characters (not blank).
+`--camera` is an optional JSON file with the pinhole intrinsics of the source
+video, which improves wrist depth:
+
+```json
+{"source_size_wh": [2560, 1440], "source_K": [[1800, 0, 1279.5], [0, 1800, 719.5], [0, 0, 1]]}
+```
+
+`source_size_wh` must equal the video's displayed size (width and height after
+any rotation metadata is applied), and `source_K` must be finite with zero skew
+and positive focal lengths. e2e cannot be combined with stereo options or
+`--method`; `--prompt` and `--camera` are only accepted with `--pipeline e2e`.
+
+Before uploading, the client checks and converts the video in a temporary
+directory with FFmpeg:
+
+- Frame rate above 30 fps or below 15 fps, duration above 20 s, or a short
+  side below 640 px or above 1440 px is rejected with an error.
+- The video is resampled by timestamp to exactly 15 fps (each output frame is
+  the source frame nearest to its 1/15 s slot), the first
+  min(241, available) frames are kept, and the count is trimmed to the
+  largest N with (N - 1) divisible by 4. Fewer than 17 frames (about 1.07 s)
+  is rejected. A 16 s or longer clip therefore uses its first 241 frames
+  (16.0 s); a 10 s clip uses 149 frames.
+- A short side above 1080 px is scaled down to 1080 px, keeping the aspect
+  ratio with even dimensions (2560x1440 becomes 1920x1080). An odd width or
+  height at or below 1080 px loses its last pixel column or row. Rotation
+  metadata is applied to the pixels.
+- Camera intrinsics are scaled with the image using the pixel-center
+  convention: fx' = fx·sx, cx' = (cx + 0.5)·sx − 0.5, and the same for y.
+- The upload is H.264 MP4, yuv420p, constant 15 fps, CRF 12, no audio,
+  `+faststart`. It is re-probed and must contain exactly N frames at 15 fps
+  at the expected size before upload.
+
+The server enforces the converted form (15 fps, 17–241 frames with (N - 1)
+divisible by 4, short side 640–1080, long side at most 2560) and answers
+`422 invalid_e2e_input`, `invalid_camera`, or `invalid_pipeline` otherwise;
+`503 annotation_e2e_disabled` means the deployment has e2e switched off.
+
 The client prints upload progress to stderr and these identifiers to stdout:
 
 ```text
@@ -69,7 +138,10 @@ below. Submission acceptance means the job is queued, not finished. Add
 
 To retry the same logical submission after an interrupted connection, pass
 `--idempotency-key <submission UUID>` with the same input files and options.
-Never reuse a key for different input or modify files while uploading.
+Never reuse a key for different input or modify files while uploading. For
+e2e, the key covers the converted video together with the pipeline, prompt,
+and camera fields; the conversion is deterministic for the same input file
+and FFmpeg build, so rerunning the same command replays the original job.
 
 ## 4. Check status and wait
 
@@ -99,9 +171,15 @@ ego-anno download "$JOB_ID" -o annotation.json
 The file is written to a temporary file and atomically moved into place after
 the complete response arrives, replacing an existing destination.
 
+e2e jobs download a `cosmos-e2e-result/v1` JSON document with `fps` 15,
+`num_frames` N, and `action`: N - 1 rows of 147 physical values (row k is the
+camera motion from frame k to k + 1 and both hands at frame k + 1), plus
+`channel_layout`, `frame_alignment`, `model`, and `receipt` describing the
+inference. e2e jobs have no rendered video.
+
 ## Input requirements
 
-The server validates these input requirements:
+For the DAG pipeline, the server validates these input requirements:
 
 - At most 1800 frames per view; longer videos are rejected, not truncated.
 - Use native fps and resolution: no frame dropping, resampling, or rescaling.
@@ -111,6 +189,8 @@ The server validates these input requirements:
 - Total upload size is at most 2 GiB. `calibration.json` is at most 1 MiB and
   contains `K_left`, `K_right`, `R_left_to_right`, `T_left_to_right_m`, and
   `image_size_wh`.
+
+For the e2e pipeline, see [e2e pipeline](#e2e-pipeline).
 
 ## Errors and exit codes
 
@@ -147,7 +227,9 @@ client.download(job_id, "annotation.json")
 ```
 
 You can also pass `api_key=` explicitly. Stereo submission is available through
-`submit_stereo(left, right, calibration, method=...)`; `status(job_id)` returns
+`submit_stereo(left, right, calibration, method=...)`, and the e2e pipeline
+through `submit_e2e(video, prompt=None, camera=None)`, where `camera` is a path
+to the camera JSON (or the equivalent dict). `status(job_id)` returns
 the decoded status document. Client failures raise `ClientError`; a certificate
 identity mismatch raises its `PinError` subclass before any request bytes are
 sent.
@@ -159,4 +241,5 @@ python -m unittest discover -s tests -v
 python -m build
 ```
 
-The test suite is offline and uses only the standard library.
+The test suite is offline and uses only the standard library; its FFmpeg tests
+run when `ffmpeg` and `ffprobe` are installed and are skipped otherwise.

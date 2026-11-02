@@ -37,6 +37,10 @@ def main(argv=None):
         sub.add_argument("--right")
         sub.add_argument("--calibration")
         sub.add_argument("--method", choices=("baseline", "stereo_sj", "stereo_sjcf"))
+        sub.add_argument("--pipeline", choices=("dag", "e2e"), default="dag",
+                         help="dag (default) or e2e (Cosmos3 hand147; needs ffmpeg)")
+        sub.add_argument("--prompt", help="e2e only: task description, at most 1000 characters")
+        sub.add_argument("--camera", help="e2e only: camera.json with source_size_wh and source_K")
         sub.add_argument("--idempotency-key")
         sub.add_argument("--wait", action="store_true")
         status = commands.add_parser("status", help="show job status")
@@ -49,6 +53,13 @@ def main(argv=None):
         dl.add_argument("-o", default="annotation.json")
         args = parser.parse_args(arguments)
         if args.command == "submit":
+            if args.pipeline == "e2e":
+                if not args.video:
+                    parser.error("--pipeline e2e requires --video")
+                if args.left or args.right or args.calibration or args.method:
+                    parser.error("--pipeline e2e cannot be combined with stereo options or --method")
+            elif args.prompt is not None or args.camera is not None:
+                parser.error("--prompt and --camera require --pipeline e2e")
             if args.video:
                 if args.left or args.right or args.calibration or args.method:
                     parser.error("--video cannot be combined with stereo options")
@@ -59,7 +70,10 @@ def main(argv=None):
         key = os.environ.get("EGO_ANNO_API_KEY") or getpass.getpass("API key: ")
         client = EgoAnnoClient(key)
         if args.command == "submit":
-            if args.video:
+            if args.pipeline == "e2e":
+                client.submit_e2e(args.video, prompt=args.prompt, camera=args.camera,
+                                  idempotency_key=args.idempotency_key, wait=args.wait)
+            elif args.video:
                 client.submit_mono(args.video,
                                    idempotency_key=args.idempotency_key, wait=args.wait)
             else:

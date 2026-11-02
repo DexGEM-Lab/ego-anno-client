@@ -7,6 +7,7 @@ import tempfile
 import time
 import uuid
 
+from . import e2e
 from .transport import CHUNK_SIZE, ClientError, Multipart, check_response, connect, headers, with_retries
 
 
@@ -21,9 +22,31 @@ class EgoAnnoClient:
             raise ClientError("API key contains an invalid character")
 
     def submit_mono(self, video, idempotency_key=None, wait=False):
-        """Submit one monocular video and return its annotation job ID."""
+        """Submit one monocular video to the DAG pipeline and return its annotation job ID."""
         files = [("video", video, mimetypes.guess_type(video)[0] or "video/mp4")]
-        return self._submit("mono", files, None, idempotency_key, wait)
+        return self._submit([("input_mode", "mono")], files, idempotency_key, wait)
+
+    def submit_e2e(self, video, prompt=None, camera=None, idempotency_key=None, wait=False):
+        """Preprocess a video locally and submit it to the e2e pipeline; return the job ID.
+
+        ``camera`` is an optional path to (or mapping of)
+        ``{"source_size_wh": [w, h], "source_K": 3x3}`` for the source video's
+        displayed size; it is rescaled with the video. Requires ffmpeg/ffprobe.
+        """
+        idempotency_key = parse_key(idempotency_key)
+        prompt = e2e.check_prompt(prompt)
+        source_camera = e2e.load_camera(camera)
+        with tempfile.TemporaryDirectory(prefix="ego-anno-e2e-") as workdir:
+            prepared = e2e.preprocess(video, workdir, source_camera)
+            fields = [("input_mode", "mono"), ("pipeline", "e2e")]
+            if prompt is not None:
+                fields.append(("prompt", prompt))
+            if prepared.camera is not None:
+                fields.append(("camera", json.dumps(prepared.camera, separators=(",", ":"))))
+            job_id = self._submit(fields, [("video", prepared.path, "video/mp4")], idempotency_key, False)
+        if wait:
+            self.wait(job_id, 10)
+        return job_id
 
     def submit_stereo(self, left, right, calibration, method=None,
                       idempotency_key=None, wait=False):
@@ -33,13 +56,13 @@ class EgoAnnoClient:
             ("right_video", right, mimetypes.guess_type(right)[0] or "video/mp4"),
             ("calibration", calibration, "application/json"),
         ]
-        return self._submit("stereo", files, method, idempotency_key, wait)
-
-    def _submit(self, input_mode, files, method, idempotency_key, wait_for_result):
-        idem = str(uuid.UUID(idempotency_key)) if idempotency_key else str(uuid.uuid4())
-        fields = [("input_mode", input_mode)]
+        fields = [("input_mode", "stereo")]
         if method:
             fields.append(("hand_refinement_method", method))
+        return self._submit(fields, files, idempotency_key, wait)
+
+    def _submit(self, fields, files, idempotency_key, wait_for_result):
+        idem = parse_key(idempotency_key) or str(uuid.uuid4())
         body = Multipart(fields, files)
         # Preserve the key even if a network failure prevents receiving the response.
         print("Idempotency-Key: {}".format(idem), flush=True)
@@ -110,6 +133,11 @@ def get_json(path, key):
         finally:
             conn.close()
     return with_retries(attempt)
+
+
+def parse_key(idempotency_key):
+    """Normalize an optional idempotency key; invalid UUIDs raise ValueError."""
+    return str(uuid.UUID(idempotency_key)) if idempotency_key else None
 
 
 def job_path(job_id):
