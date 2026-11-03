@@ -1,10 +1,52 @@
 # ego-anno client
 
 A Python 3.8+ client and command-line tool for submitting egocentric videos to
-ego-anno and retrieving annotation results. It uses only the Python standard
-library. The service endpoint and server certificate SHA-256 pin are built in;
-no endpoint configuration, CA file, or CA flag is required. The client verifies
-the pin before sending your API key or video data.
+ego-anno, retrieving annotation results, and optionally rendering Cosmos e2e
+results offline. Submission/download use only the Python standard library;
+the optional `[render]` extra installs NumPy and OpenCV. The service endpoint
+and certificate SHA-256 pin are built in: no IP configuration, SSH access,
+private repository, CA file, or CA flag is needed. Certificate identity is
+checked before the API key or video is sent.
+
+## Start here: Cosmos annotation → JSON → MP4
+
+You need **your own API key and local video**, plus Python and system FFmpeg
+4.4+ with `ffmpeg`, `ffprobe`, and the `libx264` encoder. Create an account
+and API key at **https://anno.dex-gem.ai** (API keys page); the account needs
+annotation credits. Never put a key in chat, logs, source code, or a Git commit.
+If you have no key/video, obtain them from the user rather than inventing them.
+
+Use a mono clip with 15–30 fps, duration at most 20 s, and short side
+640–1440 px. A clip of roughly 2–16 seconds is convenient for a first test.
+From a fresh directory, run:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install "ego-anno-client[render] @ https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.3.0/ego_anno_client-0.3.0-py3-none-any.whl"
+
+# Set EGO_ANNO_API_KEY privately in the environment before running the client.
+.venv/bin/ego-anno submit --pipeline e2e --video ./clip.mp4 \
+  --save-inputs ./run/inputs --wait
+
+JOB_ID=$(.venv/bin/python -c 'import json; print(json.load(open("run/inputs/submission.json"))["annotation_job_id"])')
+.venv/bin/ego-anno download "$JOB_ID" -o ./run/annotation.json
+.venv/bin/ego-anno render --result ./run/annotation.json \
+  --inputs ./run/inputs -o ./run/preview.mp4 --width 1600 --height 900
+```
+
+On Windows, use `.venv\\Scripts\\python.exe` and `.venv\\Scripts\\ego-anno.exe`.
+If known, add `--camera ./camera.json` to **submit**; the client saves its
+rescaled calibration for render automatically. Without calibration the MP4
+shows the source video and predicted 3D skeleton/trajectory, but does **not**
+invent a source-video projection. Without beta, no MANO mesh is rendered.
+
+Success means: the job is `succeeded`, downloaded JSON has schema
+`cosmos-e2e-result/v1` with `num_frames - 1` rows of 147 finite values, and
+`preview.mp4` decodes as H.264 at 15 fps with `num_frames` frames.
+Submission alone, or `--wait` alone, does not download a result.
+Each `--save-inputs` directory must be new; choose a new run directory for a
+new submission. Keep existing results and keys private.
+
 
 Two pipelines share the same account, API key, and credit balance:
 
@@ -24,19 +66,19 @@ The e2e billing ratio (default 0.1) is a deployment setting.
 ## 1. Download and install the client
 
 Install Python 3.8+ with pip, preferably in a virtual environment. Get the
-released client from the public [v0.2.0 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.2.0).
+released client from the public [v0.3.0 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.3.0).
 Install its wheel directly (no Git checkout required):
 
 ```bash
-python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.2.0/ego_anno_client-0.2.0-py3-none-any.whl"
+python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.3.0/ego_anno_client-0.3.0-py3-none-any.whl"
 ego-anno --help
 ```
 
-Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.2.0/ego_anno_client-0.2.0-py3-none-any.whl)
+Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.3.0/ego_anno_client-0.3.0-py3-none-any.whl)
 from that Release and install the local file:
 
 ```bash
-python3 -m pip install ./ego_anno_client-0.2.0-py3-none-any.whl
+python3 -m pip install ./ego_anno_client-0.3.0-py3-none-any.whl
 ```
 
 If `ego-anno` is not on your PATH, use `python3 -m ego_anno` in its place.
@@ -48,8 +90,8 @@ missing. The DAG pipeline does not use FFmpeg.
 
 ## 2. Configure your API key
 
-Create an API key in the workspace; it is shown only once. Export it in the
-terminal where you run the client (the shell examples below use Bash):
+Create an API key at [anno.dex-gem.ai](https://anno.dex-gem.ai); it is shown
+only once. Export it in the terminal where you run the client:
 
 ```bash
 export EGO_ANNO_API_KEY='<your API key>'
@@ -108,8 +150,8 @@ directory with FFmpeg:
   the source frame nearest to its 1/15 s slot), the first
   min(241, available) frames are kept, and the count is trimmed to the
   largest N with (N - 1) divisible by 4. Fewer than 17 frames (about 1.07 s)
-  is rejected. A 16 s or longer clip therefore uses its first 241 frames
-  (16.0 s); a 10 s clip uses 149 frames.
+  is rejected. A clip with 240 sampled frames is trimmed to 237; a clip with
+  at least 241 sampled frames keeps 241 (spanning 16.0 s); a 10 s clip uses 149.
 - A short side above 1080 px is scaled down to 1080 px, keeping the aspect
   ratio with even dimensions (2560x1440 becomes 1920x1080). An odd width or
   height at or below 1080 px loses its last pixel column or row. Rotation
@@ -175,7 +217,50 @@ e2e jobs download a `cosmos-e2e-result/v1` JSON document with `fps` 15,
 `num_frames` N, and `action`: N - 1 rows of 147 physical values (row k is the
 camera motion from frame k to k + 1 and both hands at frame k + 1), plus
 `channel_layout`, `frame_alignment`, `model`, and `receipt` describing the
-inference. e2e jobs have no rendered video.
+inference. The server returns JSON only; use the offline render command below
+to produce an MP4.
+
+## 6. Render e2e results offline
+
+Install this release with the `[render]` extra (see the quickstart). The wheel
+contains the renderer and physical-action decoder; no private repository,
+MANO model files, GPU, API key, or network connection is needed to render.
+System FFmpeg with libx264 is required.
+
+During submission, `--save-inputs DIR` (e2e only) retains:
+
+- `video.mp4`: exactly the bytes uploaded after frame sampling and resizing.
+- `camera.json`: processed-pixel intrinsics, **only** when supplied.
+- `submission.json`: public job ID, idempotency key, frame count, dimensions,
+  fps and optional task prompt. It never stores the API key.
+
+The directory is saved before upload. If upload fails, its job ID remains
+null and the inputs/idempotency key remain available. Existing directories
+are never overwritten. To retry a submission with the same idempotency key,
+omit `--save-inputs` or choose a different save directory; do not replace the
+original bundle with unrelated footage.
+
+```bash
+ego-anno render --result ./run/annotation.json --inputs ./run/inputs \
+  -o ./run/preview.mp4
+```
+
+Optional `--width`/`--height` change only the output layout, not calibration.
+Use the saved inputs belonging to this result, **not** the original
+30 fps/resized video or unscaled camera. Frame count, fps and processed
+dimensions must match. The original temporary video is deleted without
+`--save-inputs`, so retain the bundle when you intend to visualize.
+
+The preview keeps all N video frames. I0 has no hand prediction; action row k
+is shown on I(k+1). Translations/joints are already physical meters and are
+not inverse-normalized again. Camera motion is integrated with I0 as world
+origin. Hand visibility/object classes and MANO beta are not inferred.
+The command writes H.264/yuv420p/faststart MP4 atomically and preserves an
+existing output if rendering fails. It does not overwrite bundle inputs.
+
+The renderer snapshot's source commit/hashes are recorded in the installed
+`ego_anno/rendering/provenance.json`; this is provenance, not a runtime download.
+
 
 ## Input requirements
 

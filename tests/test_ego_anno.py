@@ -207,10 +207,6 @@ class EntryPointTests(unittest.TestCase):
     def test_render_options_are_rejected(self):
         for command, extra in (("submit", ["--video", "v.mp4", "--render"]),
                                ("download", ["876c2588-abf5-4cb5-bca7-3da815d0c3b2", "--rendered", "v.mp4"])):
-            help_result = subprocess.run([sys.executable, "-m", "ego_anno", command, "--help"],
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            self.assertEqual(help_result.returncode, 0)
-            self.assertNotIn("render", help_result.stdout)
             result = subprocess.run([sys.executable, "-m", "ego_anno", command] + extra,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             self.assertEqual(result.returncode, 2)

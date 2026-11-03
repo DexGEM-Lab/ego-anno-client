@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ego-anno-client"
-version = "0.2.0"
-description = "Zero-dependency Python client and CLI for ego-anno annotations"
+version = "0.3.0"
+description = "Python client and CLI for ego-anno annotation and optional offline visualization"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
@@ -21,6 +21,9 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = []
+
+[project.optional-dependencies]
+render = ["numpy>=1.24,<3", "opencv-python-headless==4.11.0.86"]
 
 [project.scripts]
 ego-anno = "ego_anno.cli:main"

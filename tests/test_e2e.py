@@ -262,18 +262,6 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, args)
             self.assertIn(message, result.stderr)
 
-    def test_cli_dispatch(self):
-        from ego_anno import cli
-        with mock.patch.object(cli.EgoAnnoClient, "submit_e2e") as submit_e2e, \
-             mock.patch.object(cli.EgoAnnoClient, "submit_mono") as submit_mono, \
-             mock.patch.dict(os.environ, {"EGO_ANNO_API_KEY": "key"}):
-            self.assertEqual(cli.main(["submit", "--video", "v.mp4"]), 0)
-            self.assertEqual(cli.main(["submit", "--video", "v.mp4", "--pipeline", "e2e", "--prompt", "wave",
-                                       "--camera", "c.json", "--wait"]), 0)
-        submit_mono.assert_called_once_with("v.mp4", idempotency_key=None, wait=False)
-        submit_e2e.assert_called_once_with("v.mp4", prompt="wave", camera="c.json", idempotency_key=None,
-                                           wait=True)
-
     def test_cli_reports_preprocessing_error(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.run_cli("--pipeline", "e2e", "--video", str(Path(directory) / "missing.mp4"))

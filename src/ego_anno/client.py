@@ -3,6 +3,7 @@ import http.client
 import json
 import mimetypes
 import os
+import shutil
 import tempfile
 import time
 import uuid
@@ -26,24 +27,36 @@ class EgoAnnoClient:
         files = [("video", video, mimetypes.guess_type(video)[0] or "video/mp4")]
         return self._submit([("input_mode", "mono")], files, idempotency_key, wait)
 
-    def submit_e2e(self, video, prompt=None, camera=None, idempotency_key=None, wait=False):
+    def submit_e2e(self, video, prompt=None, camera=None, idempotency_key=None, wait=False,
+                   save_inputs=None):
         """Preprocess a video locally and submit it to the e2e pipeline; return the job ID.
 
         ``camera`` is an optional path to (or mapping of)
         ``{"source_size_wh": [w, h], "source_K": 3x3}`` for the source video's
         displayed size; it is rescaled with the video. Requires ffmpeg/ffprobe.
+        ``save_inputs`` preserves the exact upload and processed calibration in
+        a new directory for offline rendering; no credentials are saved.
         """
-        idempotency_key = parse_key(idempotency_key)
+        idempotency_key = parse_key(idempotency_key) or str(uuid.uuid4())
+        if save_inputs is not None and os.path.lexists(save_inputs):
+            raise ClientError("--save-inputs directory already exists: {}".format(save_inputs))
         prompt = e2e.check_prompt(prompt)
         source_camera = e2e.load_camera(camera)
         with tempfile.TemporaryDirectory(prefix="ego-anno-e2e-") as workdir:
             prepared = e2e.preprocess(video, workdir, source_camera)
+            saved = None
+            if save_inputs is not None:
+                saved = _save_e2e_inputs(prepared, save_inputs, idempotency_key, prompt)
             fields = [("input_mode", "mono"), ("pipeline", "e2e")]
             if prompt is not None:
                 fields.append(("prompt", prompt))
             if prepared.camera is not None:
                 fields.append(("camera", json.dumps(prepared.camera, separators=(",", ":"))))
             job_id = self._submit(fields, [("video", prepared.path, "video/mp4")], idempotency_key, False)
+            if saved is not None:
+                saved["annotation_job_id"] = job_id
+                _write_json(os.path.join(save_inputs, "submission.json"), saved)
+                print("Saved rendering inputs: {}".format(os.path.abspath(save_inputs)), flush=True)
         if wait:
             self.wait(job_id, 10)
         return job_id
@@ -120,6 +133,43 @@ class EgoAnnoClient:
         """Atomically download an annotation result."""
         path = job_path(job_id)
         download(path + "/result", destination, self.api_key)
+
+
+def _write_json(path, document):
+    fd, temporary = tempfile.mkstemp(prefix=".ego-anno-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(document, out, ensure_ascii=False, allow_nan=False, indent=2)
+            out.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _save_e2e_inputs(prepared, destination, idempotency_key, prompt):
+    destination = os.path.abspath(destination)
+    os.makedirs(destination, mode=0o700, exist_ok=False)
+    metadata = {
+        "schema": "ego-anno-e2e-input/v1",
+        "pipeline": "e2e",
+        "num_frames": prepared.num_frames,
+        "fps": e2e.TARGET_FPS,
+        "width": prepared.width,
+        "height": prepared.height,
+        "idempotency_key": idempotency_key,
+        "annotation_job_id": None,
+        "prompt": prompt,
+    }
+    try:
+        shutil.copyfile(prepared.path, os.path.join(destination, "video.mp4"))
+        if prepared.camera is not None:
+            _write_json(os.path.join(destination, "camera.json"), prepared.camera)
+        _write_json(os.path.join(destination, "submission.json"), metadata)
+    except BaseException:
+        shutil.rmtree(destination)
+        raise
+    return metadata
 
 
 def get_json(path, key):

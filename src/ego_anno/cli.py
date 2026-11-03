@@ -41,6 +41,8 @@ def main(argv=None):
                          help="dag (default) or e2e (Cosmos3 hand147; needs ffmpeg)")
         sub.add_argument("--prompt", help="e2e only: task description, at most 1000 characters")
         sub.add_argument("--camera", help="e2e only: camera.json with source_size_wh and source_K")
+        sub.add_argument("--save-inputs", metavar="DIR",
+                         help="e2e only: preserve the exact upload and camera for offline rendering")
         sub.add_argument("--idempotency-key")
         sub.add_argument("--wait", action="store_true")
         status = commands.add_parser("status", help="show job status")
@@ -51,6 +53,12 @@ def main(argv=None):
         dl = commands.add_parser("download", help="download results")
         dl.add_argument("job_id")
         dl.add_argument("-o", default="annotation.json")
+        render = commands.add_parser("render", help="render a downloaded e2e result offline")
+        render.add_argument("--result", required=True, help="downloaded Cosmos result JSON")
+        render.add_argument("--inputs", required=True, help="directory created by submit --save-inputs")
+        render.add_argument("-o", required=True, help="output H.264 MP4")
+        render.add_argument("--width", type=int)
+        render.add_argument("--height", type=int)
         args = parser.parse_args(arguments)
         if args.command == "submit":
             if args.pipeline == "e2e":
@@ -58,8 +66,8 @@ def main(argv=None):
                     parser.error("--pipeline e2e requires --video")
                 if args.left or args.right or args.calibration or args.method:
                     parser.error("--pipeline e2e cannot be combined with stereo options or --method")
-            elif args.prompt is not None or args.camera is not None:
-                parser.error("--prompt and --camera require --pipeline e2e")
+            elif args.prompt is not None or args.camera is not None or args.save_inputs is not None:
+                parser.error("--prompt, --camera and --save-inputs require --pipeline e2e")
             if args.video:
                 if args.left or args.right or args.calibration or args.method:
                     parser.error("--video cannot be combined with stereo options")
@@ -67,12 +75,18 @@ def main(argv=None):
                 parser.error("provide --video or all of --left, --right and --calibration")
         if args.command == "wait" and args.interval <= 0:
             parser.error("--interval must be positive")
+        if args.command == "render":
+            from .rendering import render_result
+            output = render_result(args.result, args.inputs, args.o, args.width, args.height)
+            print("Rendered {}".format(output))
+            return 0
         key = os.environ.get("EGO_ANNO_API_KEY") or getpass.getpass("API key: ")
         client = EgoAnnoClient(key)
         if args.command == "submit":
             if args.pipeline == "e2e":
                 client.submit_e2e(args.video, prompt=args.prompt, camera=args.camera,
-                                  idempotency_key=args.idempotency_key, wait=args.wait)
+                                  idempotency_key=args.idempotency_key, wait=args.wait,
+                                  save_inputs=args.save_inputs)
             elif args.video:
                 client.submit_mono(args.video,
                                    idempotency_key=args.idempotency_key, wait=args.wait)
