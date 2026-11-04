@@ -43,6 +43,16 @@ invent a source-video projection. Without beta, no MANO mesh is rendered.
 Success means: the job is `succeeded`, downloaded JSON has schema
 `cosmos-e2e-result/v1` with `num_frames - 1` rows of 147 finite values, and
 `preview.mp4` decodes as H.264 at 15 fps with `num_frames` frames.
+
+The default `dag` pipeline renders from the video you submitted instead of a
+saved bundle:
+
+```bash
+ego-anno submit --video ./clip.mp4 --wait
+JOB_ID=...  # printed by submit
+ego-anno download "$JOB_ID" -o ./run/annotation.json
+ego-anno render --result ./run/annotation.json --video ./clip.mp4 -o ./run/preview.mp4
+```
 Submission alone, or `--wait` alone, does not download a result.
 Each `--save-inputs` directory must be new; choose a new run directory for a
 new submission. Keep existing results and keys private.
@@ -58,7 +68,8 @@ Two pipelines share the same account, API key, and credit balance:
 | Local processing | None; the file is uploaded as-is | Resampled to 15 fps, first 17–241 frames kept, short side above 1080 px scaled to 1080 |
 | Extra inputs | `--method` (stereo only) | Optional `--prompt` and `--camera` intrinsics |
 | Billing | Whole seconds of video duration | `max(1, ceil(duration × 0.1))` seconds of the uploaded 15 fps clip |
-| Result | Annotation JSON | `cosmos-e2e-result/v1` JSON with 15 Hz camera motion and 147-D hand actions |
+| Result | `ego.annotation.product_json.v3` annotation JSON | `cosmos-e2e-result/v1` JSON with 15 Hz camera motion and 147-D hand actions |
+| Local render | `ego-anno render --video <the submitted video>` | `ego-anno render --inputs <saved inputs>` |
 | Needs | Python only | Python plus FFmpeg (`ffmpeg` and `ffprobe` on PATH) |
 
 The e2e billing ratio (default 0.1) is a deployment setting.
@@ -79,6 +90,14 @@ from that Release and install the local file:
 
 ```bash
 python3 -m pip install ./ego_anno_client-0.3.0-py3-none-any.whl
+```
+
+Rendering `dag` results locally (`--video`, section 6) is in this source tree
+and ships in the next release. Until that release is published, install the
+renderer from the repository, which needs no build backend beyond `pip`:
+
+```bash
+python3 -m pip install "ego-anno-client[render] @ git+https://github.com/DexGEM-Lab/ego-anno-client@main"
 ```
 
 If `ego-anno` is not on your PATH, use `python3 -m ego_anno` in its place.
@@ -220,12 +239,54 @@ camera motion from frame k to k + 1 and both hands at frame k + 1), plus
 inference. The server returns JSON only; use the offline render command below
 to produce an MP4.
 
-## 6. Render e2e results offline
+## 6. Render results offline
+
+A result JSON is the complete product of a job. The server-side MP4 is an
+opt-in per-job option for API callers (`render=true` on submission); this
+client never requests it, so submissions stay JSON-only and an acknowledged
+job costs no rendering time. Render locally when you want a video:
+
+| You have | Command |
+| --- | --- |
+| A `dag` result and the exact video you submitted | `ego-anno render --result annotation.json --video clip.mp4 -o preview.mp4` |
+| An `e2e` result and its saved inputs | `ego-anno render --result annotation.json --inputs ./run/inputs -o preview.mp4` |
 
 Install this release with the `[render]` extra (see the quickstart). The wheel
 contains the renderer and physical-action decoder; no private repository,
-MANO model files, GPU, API key, or network connection is needed to render.
-System FFmpeg with libx264 is required.
+GPU, API key, or network connection is needed to render. System FFmpeg with
+libx264 is required. The output is H.264/yuv420p/faststart and is published
+atomically: rendering never overwrites the result, the video, or an existing
+destination.
+
+### dag results
+
+```bash
+ego-anno render --result ./annotation.json --video ./clip.mp4 -o ./preview.mp4
+```
+
+The `dag` result is `ego.annotation.product_json.v3`: per-frame 21-joint hand
+coordinates, their pixel projections, MANO shape parameters, the camera pose,
+and the subtitle rows. `--video` must be **the exact file you submitted** — the
+DAG decodes at native resolution and never resamples or trims, so those pixel
+projections only describe that file. The command refuses a video whose frame
+count differs from `Metadata.帧数`, and `--fps` must agree with the video's own
+frame rate when you supply it (it is only needed when the container reports no
+frame rate).
+
+The preview is the same two-pane layout the server produces: the source video
+with the measured joint skeletons overlaid, and a 3D pane with the camera
+trajectory and hands, above a subtitle band. Optional `--width`/`--height`
+change only the layout, never the calibration.
+
+MANO hand surfaces require the licensed MANO model, which is not distributed
+with this client. Without `--mano-dir` the render draws the measured 21-joint
+skeletons that the result already contains, in both panes, and prints that
+limitation; nothing is fabricated and no surface is invented. Point
+`--mano-dir` at a directory containing `MANO_LEFT.pkl`, `MANO_RIGHT.pkl`, and
+`mano_runtime.npz` (the `render_pack/mano` directory of an ego-compute
+checkout) to also draw the fitted surfaces.
+
+### e2e results
 
 During submission, `--save-inputs DIR` (e2e only) retains:
 
@@ -328,3 +389,17 @@ python -m build
 
 The test suite is offline and uses only the standard library; its FFmpeg tests
 run when `ffmpeg` and `ffprobe` are installed and are skipped otherwise.
+
+Two opt-in checks render real saved artifacts instead of synthetic fixtures and
+diff the result against the server-rendered product; both are skipped unless
+their environment variable is set:
+
+```bash
+# A directory holding annotation-result.json, rgb.mp4 and (optionally)
+# annotation-rendered.mp4 from one real job.
+EGO_ANNO_REAL_RESULT_DIR=/path/to/artifacts python -m pytest tests/test_rendering.py -k RealSavedArtifactTests
+
+# Adds the licensed-asset parity check (draws MANO surfaces too).
+EGO_ANNO_MANO_DIR=/path/to/render_pack/mano EGO_ANNO_REAL_RESULT_DIR=/path/to/artifacts \
+  python -m pytest tests/test_rendering.py -k licensed
+```
