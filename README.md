@@ -257,10 +257,10 @@ job costs no rendering time. Render locally when you want a video:
 | A `dag` result and the exact video you submitted | `ego-anno render --result annotation.json --video clip.mp4 -o preview.mp4` |
 | An `e2e` result and its saved inputs | `ego-anno render --result annotation.json --inputs ./run/inputs -o preview.mp4` |
 
-Install this release with the `[render]` extra (see the quickstart). The wheel
-contains the renderer and physical-action decoder; no private repository,
-GPU, API key, or network connection is needed to render. System FFmpeg with
-libx264 is required. The output is H.264/yuv420p/faststart and is published
+Install with the `[render]` extra (see
+[section 1](#1-download-and-install-the-client)). The package contains the
+renderer and physical-action decoder; no private repository, GPU, API key, or
+network connection is needed to render. System FFmpeg with libx264 is required. The output is H.264/yuv420p/faststart and is published
 atomically: rendering never overwrites the result, the video, or an existing
 destination.
 
