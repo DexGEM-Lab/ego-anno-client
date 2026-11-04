@@ -53,10 +53,14 @@ def main(argv=None):
         dl = commands.add_parser("download", help="download results")
         dl.add_argument("job_id")
         dl.add_argument("-o", default="annotation.json")
-        render = commands.add_parser("render", help="render a downloaded e2e result offline")
-        render.add_argument("--result", required=True, help="downloaded Cosmos result JSON")
-        render.add_argument("--inputs", required=True, help="directory created by submit --save-inputs")
-        render.add_argument("-o", required=True, help="output H.264 MP4")
+        render = commands.add_parser("render", help="render a downloaded result offline")
+        render.add_argument("--result", required=True, help="downloaded result JSON (DAG or Cosmos e2e)")
+        render.add_argument("--inputs", help="directory created by submit --save-inputs (e2e bundle)")
+        render.add_argument("--video", help="the exact video the job was submitted with")
+        render.add_argument("--camera", help="Cosmos only: calibration JSON for the processed video")
+        render.add_argument("--mano-dir", help="licensed MANO asset directory for surface rendering")
+        render.add_argument("--fps", type=float, help="DAG only: source frame rate when it cannot be probed")
+        render.add_argument("-o", "--output", required=True, help="output H.264 MP4")
         render.add_argument("--width", type=int)
         render.add_argument("--height", type=int)
         args = parser.parse_args(arguments)
@@ -76,8 +80,19 @@ def main(argv=None):
         if args.command == "wait" and args.interval <= 0:
             parser.error("--interval must be positive")
         if args.command == "render":
-            from .rendering import render_result
-            output = render_result(args.result, args.inputs, args.o, args.width, args.height)
+            from .rendering import render_result, render_video_result
+            if (args.inputs is None) == (args.video is None):
+                parser.error("provide exactly one of --inputs DIR (saved e2e bundle) or --video FILE")
+            if args.inputs is not None:
+                for name in ("camera", "mano_dir", "fps"):
+                    if getattr(args, name) is not None:
+                        parser.error("--{} applies only to the --video form".format(name.replace("_", "-")))
+                output = render_result(args.result, args.inputs, args.output,
+                                       args.width, args.height)
+            else:
+                output = render_video_result(args.result, args.video, args.output,
+                                             width=args.width, height=args.height,
+                                             camera=args.camera, fps=args.fps, mano_dir=args.mano_dir)
             print("Rendered {}".format(output))
             return 0
         key = os.environ.get("EGO_ANNO_API_KEY") or getpass.getpass("API key: ")
