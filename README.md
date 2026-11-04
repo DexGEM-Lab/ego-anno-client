@@ -22,7 +22,9 @@ From a fresh directory, run:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install "ego-anno-client[render] @ https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.3.0/ego_anno_client-0.3.0-py3-none-any.whl"
+# `main` carries the local dag renderer used below; the published v0.3.0 wheel
+# does not (see section 1).
+.venv/bin/python -m pip install "ego-anno-client[render] @ git+https://github.com/DexGEM-Lab/ego-anno-client@main"
 
 # Set EGO_ANNO_API_KEY privately in the environment before running the client.
 .venv/bin/ego-anno submit --pipeline e2e --video ./clip.mp4 \
@@ -92,13 +94,17 @@ from that Release and install the local file:
 python3 -m pip install ./ego_anno_client-0.3.0-py3-none-any.whl
 ```
 
-Rendering `dag` results locally (`--video`, section 6) is in this source tree
-and ships in the next release. Until that release is published, install the
-renderer from the repository, which needs no build backend beyond `pip`:
+Rendering `dag` results locally (`--video`, section 6) is on `main` and reports
+itself as `ego-anno-client 0.4.0` (`pip show ego-anno-client`); the published
+`v0.3.0` wheel predates it. Install from the repository meanwhile — pip needs a
+Git client for the `git+https` source and fetches the build backend itself:
 
 ```bash
 python3 -m pip install "ego-anno-client[render] @ git+https://github.com/DexGEM-Lab/ego-anno-client@main"
 ```
+
+Once `v0.4.0` is published, its wheel URL replaces that line, exactly like the
+`v0.3.0` line above.
 
 If `ego-anno` is not on your PATH, use `python3 -m ego_anno` in its place.
 
