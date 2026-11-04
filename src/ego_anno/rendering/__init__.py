@@ -1,4 +1,13 @@
-"""Offline Cosmos rendering; optional numerical dependencies are loaded on demand.
+"""Offline rendering of annotation results; optional numerical dependencies load on demand.
+
+Two anchored entry points publish the same browser-playable MP4:
+
+``render_result``
+    a saved e2e bundle (``--save-inputs``: video, submission.json, optional
+    camera.json) with the processed-video identity proven from the bundle.
+``render_video_result``
+    any supported result JSON plus the exact video that job consumed, so a
+    result downloaded from the web UI or the API can be rendered locally.
 
 The rendering algorithms are unmodified snapshots described by provenance.json.
 Only this wrapper handles the public input bundle, subprocesses, and publication.
@@ -15,7 +24,15 @@ import tempfile
 
 from ..transport import ClientError
 
-__all__ = ["render_result"]
+__all__ = ["render_result", "render_video_result"]
+
+DAG_SCHEMA = "ego.annotation.product_json.v3"
+COSMOS_SCHEMA = "cosmos-e2e-result/v1"
+SUPPORTED_SCHEMAS = (COSMOS_SCHEMA, DAG_SCHEMA)
+
+# The DAG writes one 手0/手1 entry per frame; MANO shape parameters live here.
+HAND_KEYS = ("手0", "手1")
+SHAPE_KEY = "beta参数"
 
 
 def _read_object(path, label):
@@ -67,6 +84,18 @@ def _refuse_collision(destination, protected):
             raise ClientError("output must not overwrite result or saved input: {}".format(path))
 
 
+def _check_output_dimensions(width, height, fallback):
+    """Return the even (width, height) pair to encode; never round silently."""
+    for name, value in (("width", width), ("height", height)):
+        if value is not None and (not _positive_integer(value) or value % 2):
+            raise ClientError("render {} must be a positive even integer".format(name))
+    output_size = [width if width is not None else fallback[0],
+                   height if height is not None else fallback[1]]
+    if output_size[0] < 4 or output_size[1] < 168 or any(value % 2 for value in output_size):
+        raise ClientError("render dimensions must be even, at least 4 pixels wide and 168 pixels high")
+    return output_size
+
+
 def _load_video_dependency():
     try:
         importlib.import_module("numpy")
@@ -98,6 +127,34 @@ def _run(command, environment, label):
         raise ClientError("{} failed: {}".format(label, detail))
 
 
+def _encode_renderer_output(result_path, video_path, camera_path, destination, width, height, extra):
+    """Run the vendored renderer, re-encode its MP4 to H.264, then publish atomically."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise ClientError("offline rendering requires system ffmpeg with the libx264 encoder on PATH")
+    environment = _subprocess_environment()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Same filesystem as destination: only the final replace can publish.
+    with tempfile.TemporaryDirectory(prefix=".ego-anno-render-", dir=str(destination.parent)) as temporary:
+        temporary = Path(temporary)
+        rendered = temporary / "rendered.mp4"
+        encoded = temporary / "encoded.mp4"
+        command = [sys.executable, str(Path(__file__).with_name("render_ego_json_overlay.py")),
+                   str(result_path), "--video", str(video_path), "--output", str(rendered),
+                   "--width", str(width), "--height", str(height)]
+        if camera_path is not None:
+            command.extend(["--camera", str(camera_path)])
+        command.extend(extra)
+        _run(command, environment, "annotation renderer")
+        _run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+              "-i", str(rendered), "-map", "0:v:0", "-an", "-c:v", "libx264",
+              "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(encoded)],
+             environment, "ffmpeg H.264 encoding")
+        if not encoded.is_file() or encoded.stat().st_size == 0:
+            raise ClientError("ffmpeg did not produce an MP4; output was not replaced")
+        os.replace(str(encoded), str(destination))
+
+
 def render_result(result, inputs, output, width=None, height=None):
     """Render a saved e2e bundle and atomically publish a browser-playable MP4.
 
@@ -117,21 +174,15 @@ def render_result(result, inputs, output, width=None, height=None):
         _refuse_collision(destination, protected)
         document = _read_object(result_path, "result")
         if document.get("schema") != "cosmos-e2e-result/v1":
-            raise ClientError("offline rendering only accepts cosmos-e2e-result/v1 (DAG rendering is not supported)")
+            raise ClientError("offline rendering of a saved bundle only accepts cosmos-e2e-result/v1; "
+                              "render a DAG result with --video FILE")
         submission = _read_object(submission_path, "submission metadata")
         camera = _read_object(camera_path, "calibration") if camera_path.exists() else None
         expected_size = _validate_submission(submission, document, camera)
         if not video_path.is_file():
             raise ClientError("saved processed input video does not exist: {}".format(video_path))
-        for name, value in (("width", width), ("height", height)):
-            if value is not None and (not _positive_integer(value) or value % 2):
-                raise ClientError("render {} must be a positive even integer".format(name))
-        output_size = [width if width is not None else expected_size[0],
-                       height if height is not None else expected_size[1]]
-        if output_size[0] < 4 or output_size[1] < 168 or any(value % 2 for value in output_size):
-            raise ClientError("render dimensions must be even, at least 4 pixels wide and 168 pixels high")
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg is None:
+        output_size = _check_output_dimensions(width, height, expected_size)
+        if shutil.which("ffmpeg") is None:
             raise ClientError("offline rendering requires system ffmpeg with the libx264 encoder on PATH")
         cv2 = _load_video_dependency()
         capture = cv2.VideoCapture(str(video_path))
@@ -145,28 +196,197 @@ def render_result(result, inputs, output, width=None, height=None):
                     actual_size, expected_size))
         finally:
             capture.release()
-        environment = _subprocess_environment()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        # Same filesystem as destination: only the final replace can publish.
-        with tempfile.TemporaryDirectory(prefix=".ego-anno-render-", dir=str(destination.parent)) as temporary:
-            temporary = Path(temporary)
-            rendered = temporary / "rendered.mp4"
-            encoded = temporary / "encoded.mp4"
-            command = [sys.executable, str(Path(__file__).with_name("render_ego_json_overlay.py")),
-                       str(result_path), "--video", str(video_path), "--output", str(rendered),
-                       "--width", str(output_size[0]), "--height", str(output_size[1])]
-            if camera is not None:
-                command.extend(["--camera", str(camera_path)])
-            _run(command, environment, "Cosmos renderer")
-            _run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                  "-i", str(rendered), "-map", "0:v:0", "-an", "-c:v", "libx264",
-                  "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(encoded)],
-                 environment, "ffmpeg H.264 encoding")
-            if not encoded.is_file() or encoded.stat().st_size == 0:
-                raise ClientError("ffmpeg did not produce an MP4; output was not replaced")
-            os.replace(str(encoded), str(destination))
+        _encode_renderer_output(result_path, video_path,
+                               camera_path if camera is not None else None,
+                                destination, output_size[0], output_size[1], [])
         return destination
     except ClientError:
         raise
     except (OSError, ValueError, RuntimeError) as exc:
         raise ClientError("cannot render offline: {}".format(exc)) from None
+
+
+def _result_schema(document):
+    """Return the result schema; the DAG carries it under ``Metadata.schema``."""
+    schema = document.get("schema")
+    if isinstance(schema, str) and schema:
+        return schema
+    metadata = document.get("Metadata")
+    if isinstance(metadata, dict) and isinstance(metadata.get("schema"), str):
+        return metadata["schema"]
+    return None
+
+
+def _without_mano_shapes(document):
+    """Copy a DAG result with the MANO shape parameters removed.
+
+    The public client does not distribute the licensed MANO model, so a render
+    without assets must draw the measured 21-joint skeletons the result does
+    carry instead of fitted surfaces. Only ``手0``/``手1`` ``beta参数`` is
+    cleared; every other field reaches the renderer unchanged, and the input
+    JSON on disk is never modified.
+    """
+    prepared = dict(document)
+    frames = document.get("逐帧轨迹")
+    if not isinstance(frames, list):
+        return prepared
+    prepared_frames = []
+    for entry in frames:
+        if not isinstance(entry, dict) or len(entry) != 1:
+            prepared_frames.append(entry)
+            continue
+        key = next(iter(entry))
+        frame = entry[key]
+        if isinstance(frame, dict):
+            frame = dict(frame)
+            for hand_key in HAND_KEYS:
+                hand = frame.get(hand_key)
+                if isinstance(hand, dict) and hand.get(SHAPE_KEY) is not None:
+                    hand = dict(hand)
+                    hand[SHAPE_KEY] = None
+                    frame[hand_key] = hand
+        prepared_frames.append({key: frame})
+    prepared["逐帧轨迹"] = prepared_frames
+    return prepared
+
+
+def _write_document(path, document):
+    with open(str(path), "w", encoding="utf-8") as out:
+        json.dump(document, out, ensure_ascii=False, allow_nan=False)
+
+
+def _check_mano_dir(mano_dir):
+    root = Path(mano_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise ClientError("hand-model asset directory does not exist: {}".format(root))
+    for name in ("MANO_LEFT.pkl", "MANO_RIGHT.pkl", "mano_runtime.npz"):
+        if not (root / name).is_file():
+            raise ClientError("hand-model asset directory is missing {}: {}".format(name, root))
+    return root
+
+
+def _validate_dag_document(document):
+    """Validate the DAG result itself and return its frame count."""
+    metadata = document.get("Metadata")
+    if not isinstance(metadata, dict):
+        raise ClientError("DAG result has no Metadata object")
+    if metadata.get("schema") != DAG_SCHEMA:
+        raise ClientError("DAG result Metadata.schema must be {}".format(DAG_SCHEMA))
+    count = metadata.get("帧数")
+    if not _positive_integer(count):
+        raise ClientError("DAG result Metadata.帧数 must be a positive integer")
+    frames = document.get("逐帧轨迹")
+    if not isinstance(frames, list) or len(frames) != count:
+        raise ClientError("DAG result 逐帧轨迹 does not hold Metadata.帧数 entries")
+    for index in range(count):
+        entry = frames[index]
+        if not isinstance(entry, dict) or "帧{}".format(index + 1) not in entry:
+            raise ClientError("DAG result entry {} is not keyed 帧{}".format(index + 1, index + 1))
+    return count
+
+
+def _validate_dag_video(cv2, capture, count, requested_fps):
+    """Prove the video is the job's exact input, then return the render fps.
+
+    The DAG decodes at native resolution and never truncates or resamples, so
+    the only video the result's pixel projections describe is the exact
+    submitted file: equal frame count, equal frame rate, same grid. Anything
+    else fails here instead of producing a quietly misaligned overlay.
+    """
+    if not capture.isOpened():
+        raise ClientError("cannot decode the source video")
+    video_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    if video_count != count:
+        raise ClientError("source video has {} frames but the result has {}; render the exact "
+                          "submitted video (the DAG neither resamples nor trims frames)".format(
+                              video_count, count))
+    probed = float(capture.get(cv2.CAP_PROP_FPS))
+    if requested_fps is not None:
+        if not _finite_positive(requested_fps):
+            raise ClientError("--fps must be a finite positive number")
+        if _finite_positive(probed) and not math.isclose(probed, float(requested_fps), rel_tol=0.01):
+            raise ClientError("source video reports {:g} fps but --fps is {:g}".format(
+                probed, float(requested_fps)))
+        return float(requested_fps)
+    if not _finite_positive(probed):
+        raise ClientError("cannot read the source video frame rate; pass --fps")
+    return probed
+
+
+def render_video_result(result, video, output, width=None, height=None, camera=None, fps=None,
+                        mano_dir=None):
+    """Render a downloaded result against the exact video the job consumed.
+
+    Supported results are the DAG ``ego.annotation.product_json.v3`` document
+    and the Cosmos ``cosmos-e2e-result/v1`` document, both as served by
+    ``GET /api/v1/annotation-jobs/{id}/result``. ``video`` must be the file the
+    job was submitted with; nothing is resampled or calibrated implicitly.
+
+    MANO surfaces need the licensed hand model, which this client does not
+    distribute: without ``mano_dir`` the render draws the measured 21-joint
+    skeletons the result carries and prints that limitation. Returns the
+    destination ``Path``; no API key or network connection is used, and an
+    existing destination survives every failure.
+    """
+    temporary = None
+    try:
+        result_path = Path(result).expanduser().resolve()
+        video_path = Path(video).expanduser().resolve()
+        destination = Path(output).expanduser().resolve()
+        camera_path = Path(camera).expanduser().resolve() if camera is not None else None
+        protected = [result_path, video_path]
+        if camera_path is not None:
+            protected.append(camera_path)
+        _refuse_collision(destination, protected)
+        document = _read_object(result_path, "result")
+        schema = _result_schema(document)
+        if schema not in SUPPORTED_SCHEMAS:
+            raise ClientError("offline rendering accepts {}; got {!r}".format(
+                " or ".join(SUPPORTED_SCHEMAS), schema))
+        if not video_path.is_file():
+            raise ClientError("source video does not exist: {}".format(video_path))
+        if camera_path is not None and not camera_path.is_file():
+            raise ClientError("calibration does not exist: {}".format(camera_path))
+        assets = _check_mano_dir(mano_dir) if mano_dir is not None else None
+        count = None
+        if schema == DAG_SCHEMA:
+            if camera_path is not None:
+                raise ClientError("--camera applies to cosmos-e2e-result/v1; DAG results "
+                                  "carry their own 相机内参")
+            count = _validate_dag_document(document)
+        cv2 = _load_video_dependency()
+        capture = cv2.VideoCapture(str(video_path))
+        try:
+            if not capture.isOpened():
+                raise ClientError("cannot decode the source video: {}".format(video_path))
+            source_size = [int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                           int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))]
+
+            extra = []
+            if schema == DAG_SCHEMA:
+                extra = ["--fps", "{:g}".format(_validate_dag_video(cv2, capture, count, fps))]
+            elif fps is not None:
+                raise ClientError("--fps is fixed by the cosmos-e2e-result metadata; omit it")
+            output_size = _check_output_dimensions(width, height, source_size)
+        finally:
+            capture.release()
+        if assets is not None:
+            extra.extend(["--mano-dir", str(assets)])
+        prepared = result_path
+        if schema == DAG_SCHEMA and assets is None:
+            print("notice: the licensed MANO hand model is not distributed with this client; "
+                  "rendering the measured 21-joint skeletons. Pass --mano-dir to render surfaces.",
+                  flush=True)
+            temporary = tempfile.TemporaryDirectory(prefix="ego-anno-render-input-")
+            prepared = Path(temporary.name) / "annotation.json"
+            _write_document(prepared, _without_mano_shapes(document))
+        _encode_renderer_output(prepared, video_path, camera_path if schema == COSMOS_SCHEMA else None,
+                                destination, output_size[0], output_size[1], extra)
+        return destination
+    except ClientError:
+        raise
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ClientError("cannot render offline: {}".format(exc)) from None
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
