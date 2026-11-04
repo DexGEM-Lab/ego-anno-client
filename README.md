@@ -283,8 +283,9 @@ with this client. Without `--mano-dir` the render draws the measured 21-joint
 skeletons that the result already contains, in both panes, and prints that
 limitation; nothing is fabricated and no surface is invented. Point
 `--mano-dir` at a directory containing `MANO_LEFT.pkl`, `MANO_RIGHT.pkl`, and
-`mano_runtime.npz` (the `render_pack/mano` directory of an ego-compute
-checkout) to also draw the fitted surfaces.
+`mano_runtime.npz` (the `render_pack/mano` directory of the private
+ego-compute checkout, if you have licensed access) to also draw the fitted
+surfaces.
 
 ### e2e results
 
