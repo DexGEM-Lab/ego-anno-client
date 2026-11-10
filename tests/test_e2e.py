@@ -269,6 +269,26 @@ class CliTests(unittest.TestCase):
         self.assertIn("Error: ", result.stderr)
 
 
+class FfmpegCompatibilityTests(unittest.TestCase):
+    def test_passthrough_capability_selection(self):
+        for options, expected in [(b"-fps_mode mode\n-vsync mode", "-fps_mode"),
+                                  (b"-fps_mode[:stream_specifier] mode", "-fps_mode"),
+                                  (b"-vsync sync", "-vsync")]:
+            with mock.patch.object(e2e.subprocess, "run", return_value=subprocess.CompletedProcess([],0,options,b"")):
+                self.assertEqual(e2e.passthrough_args("ffmpeg"), [expected, "passthrough"])
+
+    def test_balanced_selection_preserves_every_member_and_bounds_depth(self):
+        import re
+        expression = e2e.video_filter(list(range(241)),640,640,e2e.Geometry(640,640,False)).split(",")[0]
+        self.assertEqual([int(x) for x in re.findall(r"not\(n-(\d+)\)", expression)], list(range(241)))
+        depth = maximum = 0
+        for char in expression:
+            if char == "(": depth += 1; maximum = max(maximum, depth)
+            elif char == ")": depth -= 1
+        self.assertEqual(depth, 0)
+        self.assertLessEqual(maximum, 9)
+
+
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg/ffprobe not installed")
 class FfmpegTests(unittest.TestCase):
     def setUp(self):
@@ -302,8 +322,16 @@ class FfmpegTests(unittest.TestCase):
     def test_rotation_uses_displayed_size(self):
         coded = self.make("coded.mp4", 30, 1.2, "1280x720")
         video = os.path.join(self.directory, "rotated.mp4")
-        subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-i", coded, "-c", "copy",
-                        "-metadata:s:v:0", "rotate=90", video], check=True)
+        help_text = subprocess.check_output(["ffmpeg", "-hide_banner", "-h", "full"])
+        # Modern FFmpeg no longer converts a rotate metadata tag into the
+        # display matrix. Build a genuinely rotated fixture on either family.
+        if b"-display_rotation" in help_text:
+            command = ["ffmpeg", "-v", "error", "-nostdin", "-display_rotation", "90",
+                       "-i", coded, "-c", "copy", video]
+        else:
+            command = ["ffmpeg", "-v", "error", "-nostdin", "-i", coded, "-c", "copy",
+                       "-metadata:s:v:0", "rotate=90", video]
+        subprocess.run(command, check=True)
         camera = e2e.load_camera({"source_size_wh": [720, 1280],
                                   "source_K": [[900, 0, 359.5], [0, 900, 639.5], [0, 0, 1]]})
         prepared = e2e.preprocess(video, self.out, camera)
@@ -312,6 +340,15 @@ class FfmpegTests(unittest.TestCase):
         stream = e2e._probe_json("ffprobe", ["-show_streams", prepared.path])["streams"][0]
         self.assertEqual((stream["width"], stream["height"]), (720, 1280))
         self.assertFalse(stream.get("side_data_list"))
+
+    def test_legal_long_clips_preserve_frame_count(self):
+        for count in (121, 241):
+            with self.subTest(frames=count):
+                video = self.make("long-{}.mp4".format(count), 15, count / 15, "640x640")
+                out = os.path.join(self.directory, "long-out-{}".format(count))
+                os.mkdir(out)
+                prepared = e2e.preprocess(video, out)
+                self.assertEqual((prepared.num_frames, prepared.width, prepared.height), (count, 640, 640))
 
     def test_rejects_low_fps(self):
         video = self.make("slow.mp4", 10, 2, "854x640")

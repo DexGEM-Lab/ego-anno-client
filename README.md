@@ -22,9 +22,7 @@ From a fresh directory, run:
 
 ```bash
 python3 -m venv .venv
-# `main` carries the local dag renderer used below; the published v0.3.0 wheel
-# does not (see section 1).
-.venv/bin/python -m pip install "ego-anno-client[render] @ git+https://github.com/DexGEM-Lab/ego-anno-client@main"
+.venv/bin/python -m pip install "ego-anno-client[render] @ https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.4.1/ego_anno_client-0.4.1-py3-none-any.whl"
 
 # Set EGO_ANNO_API_KEY privately in the environment before running the client.
 .venv/bin/ego-anno submit --pipeline e2e --video ./clip.mp4 \
@@ -79,32 +77,24 @@ The e2e billing ratio (default 0.1) is a deployment setting.
 ## 1. Download and install the client
 
 Install Python 3.8+ with pip, preferably in a virtual environment. Get the
-released client from the public [v0.3.0 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.3.0).
+released client from the public [v0.4.1 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.4.1).
 Install its wheel directly (no Git checkout required):
 
 ```bash
-python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.3.0/ego_anno_client-0.3.0-py3-none-any.whl"
+python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.4.1/ego_anno_client-0.4.1-py3-none-any.whl"
 ego-anno --help
 ```
 
-Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.3.0/ego_anno_client-0.3.0-py3-none-any.whl)
+Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.4.1/ego_anno_client-0.4.1-py3-none-any.whl)
 from that Release and install the local file:
 
 ```bash
-python3 -m pip install ./ego_anno_client-0.3.0-py3-none-any.whl
+python3 -m pip install ./ego_anno_client-0.4.1-py3-none-any.whl
 ```
 
-Rendering `dag` results locally (`--video`, section 6) is on `main` and reports
-itself as `ego-anno-client 0.4.0` (`pip show ego-anno-client`); the published
-`v0.3.0` wheel predates it. Install from the repository meanwhile — pip needs a
-Git client for the `git+https` source and fetches the build backend itself:
+The v0.4.1 wheel includes the existing optional local renderers and the e2e
+FFmpeg 9 compatibility fix. Use the `[render]` extra only when rendering locally.
 
-```bash
-python3 -m pip install "ego-anno-client[render] @ git+https://github.com/DexGEM-Lab/ego-anno-client@main"
-```
-
-Once `v0.4.0` is published, its wheel URL replaces that line, exactly like the
-`v0.3.0` line above.
 
 If `ego-anno` is not on your PATH, use `python3 -m ego_anno` in its place.
 
@@ -410,3 +400,11 @@ EGO_ANNO_REAL_RESULT_DIR=/path/to/artifacts python -m pytest tests/test_renderin
 EGO_ANNO_MANO_DIR=/path/to/render_pack/mano EGO_ANNO_REAL_RESULT_DIR=/path/to/artifacts \
   python -m pytest tests/test_rendering.py -k licensed
 ```
+
+### FFmpeg compatibility
+
+E2e preprocessing supports FFmpeg 4.4 and newer, including builds that removed
+`-vsync`. The client detects `-fps_mode` support from the installed binary and
+uses it when available, otherwise uses legacy `-vsync`. Exact timestamp-selected
+source frames are preserved with a balanced selection expression, avoiding the
+parser-depth failure for 121/241-frame clips. No frame sampling rule changes.

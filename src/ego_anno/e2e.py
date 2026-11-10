@@ -15,8 +15,8 @@ and ``ffmpeg`` binaries (standard library subprocesses only):
    min(241, slots) slots, trim to the largest N with (N - 1) % 4 == 0, and
    reject N < 17.
 4. Decode only the chosen source frames with the ffmpeg video filter
-   ``select=not(n-i0)+not(n-i1)+...,<geometry>,format=yuv420p``
-   (``-vsync passthrough``, raw yuv420p to a pipe; ``n`` is the decode-order
+   ``select=<balanced sum of not(n-index) terms>,<geometry>,format=yuv420p``
+   (``-fps_mode passthrough`` or legacy ``-vsync passthrough``, raw yuv420p to a pipe; ``n`` is the decode-order
    frame index that ``ffprobe`` reported). ``<geometry>`` is
    ``scale=W:H:flags=lanczos`` when the short side exceeds 1080 (short side
    becomes 1080, long side the nearest even value keeping the aspect ratio),
@@ -183,7 +183,15 @@ def rescale_camera(camera, source_width, source_height, geometry):
 
 
 def video_filter(unique_indices, source_width, source_height, geometry):
-    selected = "+".join("not(n-{})".format(i) for i in unique_indices)
+    terms = ["not(n-{})".format(i) for i in unique_indices]
+    if not terms:
+        raise ClientError("frame selection is empty")
+    # AVExpr recursively parses sums: a flat 241-term expression overflows
+    # newer FFmpeg's parser. A balanced tree keeps exactly the same membership.
+    while len(terms) > 1:
+        terms = ["({}+{})".format(terms[i], terms[i + 1]) if i + 1 < len(terms)
+                 else terms[i] for i in range(0, len(terms), 2)]
+    selected = terms[0]
     steps = ["select=" + selected]
     if geometry.scaled:
         steps.append("scale={}:{}:flags=lanczos".format(geometry.width, geometry.height))
@@ -291,14 +299,31 @@ def _wait(process, log, name):
         raise ClientError("{} failed: {}".format(name, _tail(log.read())))
 
 
+def passthrough_args(ffmpeg):
+    """Inspect capabilities instead of guessing a vendor build's version."""
+    try:
+        result = subprocess.run([ffmpeg, "-hide_banner", "-h", "full"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    except OSError as exc:
+        raise ClientError("cannot inspect ffmpeg: {}".format(exc))
+    if result.returncode:
+        raise ClientError("ffmpeg capability check failed: {}".format(_tail(result.stderr)))
+    options = result.stdout.decode("utf-8", "replace")
+    if any(line.startswith(("-fps_mode ", "-fps_mode[")) for line in options.splitlines()):
+        return ["-fps_mode", "passthrough"]
+    if any(line.startswith("-vsync ") for line in options.splitlines()):
+        return ["-vsync", "passthrough"]
+    raise ClientError("ffmpeg has neither fps_mode nor vsync passthrough support")
+
+
 def transcode(ffmpeg, video, output, indices, source_width, source_height, geometry):
     """Write the slot frames ``indices`` (source frame numbers) as a 15 fps H.264 MP4."""
     unique = sorted(set(indices))
     repeats = [indices.count(i) for i in unique]
     frame_bytes = geometry.width * geometry.height * 3 // 2
     decode = [ffmpeg, "-nostdin", "-v", "error", "-i", _input(video), "-map", "0:v:0", "-an", "-sn", "-dn",
-              "-vf", video_filter(unique, source_width, source_height, geometry),
-              "-vsync", "passthrough", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"]
+              "-vf", video_filter(unique, source_width, source_height, geometry)
+              ] + passthrough_args(ffmpeg) + ["-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"]
     encode = [ffmpeg, "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p",
               "-s", "{}x{}".format(geometry.width, geometry.height), "-framerate", str(TARGET_FPS),
               "-i", "pipe:0", "-map", "0:v:0", "-an", "-c:v", "libx264", "-crf", str(CRF),
