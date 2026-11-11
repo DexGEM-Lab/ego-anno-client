@@ -42,6 +42,10 @@ KEYPOINT_COLOR = (40, 40, 255)                 # RRD KEYPOINT_RGBA red
 SKIN_COLOR = (160, 205, 240)                   # RRD SKIN_RGBA [240, 205, 160]
 CAMERA_COLOR = (22, 25, 28)                   # near-black cinema camera (BGR)
 TRAIL_COLOR = (255, 180, 60)                   # RRD TRAIL_RGBA [60, 180, 255]
+# Vertical eye offset as a multiple of the standoff `d`. Together with the 0.9
+# forward and 0.5 lateral offsets this is the observer's elevation above the
+# anchor: atan2(0.67, hypot(0.9, 0.5)) = 33.0 deg.
+_EYE_ELEVATION = 0.67
 GRID_COLOR = (91, 89, 83)                     # sampled bright grid core, BGR
 # Rerun's spatial viewport is a dark blue-green shaded floor rather than the
 # neutral gray used by the old overlay.  Corners are sampled from the target
@@ -494,6 +498,21 @@ def _follow_anchor(pose: np.ndarray, centers: np.ndarray, frame_index: int,
     return smoothed
 
 
+def _trajectory_upto(centers: np.ndarray, frame_index: int) -> np.ndarray:
+    """Camera path from the clip start up to and including the current frame.
+
+    The RRD spatial view logs the trail as a static strip of every valid pose,
+    but a per-frame raster must accumulate: drawing the whole clip at frame 0
+    would show the camera walking along a path it has not taken yet, and would
+    also make the final-frame picture of a short clip identical to its opening
+    frame. Points after `frame_index` are dropped, not skipped, so the polyline
+    still terminates exactly at the current camera body.
+    """
+    end = int(np.clip(frame_index + 1, 0, len(centers)))
+    past = np.asarray(centers[:end], dtype=np.float64)
+    return past[np.isfinite(past).all(axis=1)]
+
+
 def _look_at_view(eye: np.ndarray, target: np.ndarray, up_hint: np.ndarray) -> dict[str, np.ndarray]:
     """Build an orthonormal right-handed basis that looks from `eye` at `target`.
 
@@ -553,7 +572,11 @@ def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, hei
     # the up hint is the camera's own -down axis: the horizon stays level and the
     # frame follows the camera without spinning about the view axis.
     anchor = center if follow_anchor is None else np.asarray(follow_anchor, dtype=np.float64)
-    eye = anchor - forward * (0.9 * d) - right * (0.5 * d) - down * (0.5 * d)
+    # Elevation is atan2(ELEVATION, hypot(0.9, 0.5)) = 33.0 deg above the anchor's
+    # horizontal plane (was 25.9 deg at a 0.5 vertical offset): a small downward
+    # tilt that shows more of the floor grid the trail runs along, while the
+    # look-at target, lateral offset, standoff and up hint stay untouched.
+    eye = anchor - forward * (0.9 * d) - right * (0.5 * d) - down * (_EYE_ELEVATION * d)
     target = np.asarray(merged, dtype=np.float64).mean(axis=0) if len(merged) else (anchor + forward * d)
     basis = _look_at_view(eye, target, -down)
     view: dict[str, np.ndarray | float] = {
@@ -894,11 +917,6 @@ def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, 
     follow_anchor = _follow_anchor(pose, centers, frame_index, frame_joints)
     view = _rear_view(pose, frame_joints, width, height, cam_world, follow_anchor)
     _draw_camera_grid(canvas, pose, frame_joints, view)
-    trajectory = centers[np.isfinite(centers).all(axis=1)]
-
-    # Draw the blue trail behind the current objects, as in the spatial view.
-    if len(trajectory) >= 2:
-        _draw_view_line(canvas, trajectory, view, TRAIL_COLOR, 2)
 
     skin_color = SKIN_COLOR
     for side in range(2):
@@ -916,6 +934,17 @@ def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, 
     # small RGB axis arrows sit on top of the dark body.
     pixels, _, _, xyz = _project_view(cam_world, view, (width, height))
     _draw_mesh_pixels(canvas, pixels, xyz, cam_faces, CAMERA_COLOR, alpha=1.0, edges=False)
+    # The trail is drawn AFTER the opaque camera body and before the axis arrows.
+    # Drawing it first buried it completely: the path spans ~0.036 m against a
+    # 0.193 m camera prop, so in these near-static clips it projects entirely
+    # inside the body silhouette (measured: 0 visible trail pixels at every
+    # frame, 130 painted then fully overpainted at the midpoint). In the RRD
+    # reference the blue strip likewise rides over the black body, which is a
+    # painter-order property rather than a scale one -- no geometric
+    # exaggeration is applied here.
+    trajectory = _trajectory_upto(centers, frame_index)
+    if len(trajectory) >= 2:
+        _draw_view_line(canvas, trajectory, view, TRAIL_COLOR, 2)
     _draw_camera_marker(canvas, pose, view)
     return canvas
 

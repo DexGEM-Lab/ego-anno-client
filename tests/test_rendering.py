@@ -606,7 +606,16 @@ class DagResultTests(unittest.TestCase):
             self.assertGreater(abs(rear), abs(vertical))
             # Eye placement follows the spec ratios against the adaptive distance.
             self.assertAlmostEqual(abs(lateral / rear), 0.5 / 0.9, places=6)
-            self.assertAlmostEqual(abs(vertical / rear), 0.5 / 0.9, places=6)
+            self.assertAlmostEqual(abs(vertical / rear), renderer._EYE_ELEVATION / 0.9, places=6)
+            # Elevation above the anchor's horizontal plane is the one knob the
+            # "look down slightly more" request turned. It is measured against
+            # the full horizontal offset (forward AND lateral), not forward
+            # alone: atan2(vertical, hypot(rear, lateral)) = 33.0 deg, up from
+            # 25.9 deg with the old 0.5 vertical factor.
+            elevation = np.degrees(np.arctan2(abs(vertical), np.hypot(abs(rear), abs(lateral))))
+            self.assertGreater(elevation, 31.5)
+            self.assertLess(elevation, 34.5)
+            self.assertAlmostEqual(elevation, 33.05, places=1)
 
     def test_view_basis_is_a_rigid_look_at_frame(self):
         import numpy as np
@@ -707,6 +716,45 @@ class DagResultTests(unittest.TestCase):
         self.assertGreater(int(((rendered[:, :, 2] > 150) & (rendered[:, :, 2] > rendered[:, :, 0] * 1.8) & (rendered[:, :, 2] > rendered[:, :, 1] * 1.8)).sum()), 20)
         # The camera body is intentionally near-black, not the old red prop.
         self.assertGreater(int(((rendered[:, :, 0] < 45) & (rendered[:, :, 1] < 45) & (rendered[:, :, 2] < 45)).sum()), 20)
+
+    def test_trail_accumulates_to_the_current_frame_and_survives_the_camera_body(self):
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        intrinsic = np.asarray(self.document["Metadata"]["相机内参"], dtype=float)
+        hand = np.asarray(self.document["逐帧轨迹"][0]["帧1"]["手0"]["手部21点坐标"], dtype=float)
+        # A realistic head-wander path: ~3 cm of total travel, i.e. far smaller
+        # than the 19 cm camera prop, which is exactly the regime where a trail
+        # drawn *before* the opaque body is completely overpainted.
+        steps = np.asarray([
+            [0.000, 0.000, 0.000], [0.006, -0.002, 0.004], [0.011, -0.004, 0.009],
+            [0.009, -0.007, 0.015], [0.004, -0.009, 0.020], [0.001, -0.010, 0.026],
+        ], dtype=float)
+        pose = np.eye(4, dtype=float)
+        pose[:3, 3] = steps[-1]
+        trail_bgr = np.asarray(renderer.TRAIL_COLOR, dtype=int)
+
+        def trail_pixels(frame_index: int) -> int:
+            world = renderer._render_world((640, 400), pose, steps, frame_index, [hand, hand], [None, None], None,
+                                           [np.full(10, np.nan), np.full(10, np.nan)], intrinsic, (640, 480))
+            raster = world.astype(int)
+            # Tight threshold: the blue axis arrow's antialiased rim lands near
+            # BGR [194, 125, 65], which is inside a loose 70 window. At 40 the
+            # match is attributable to the trail itself.
+            return int((np.abs(raster - trail_bgr).max(axis=2) < 40).sum())
+
+        # The path is painted over the opaque camera body at every frame once it
+        # has length -- this is the regression that hid it entirely before.
+        for frame_index in range(1, len(steps)):
+            self.assertGreater(trail_pixels(frame_index), 0,
+                               "trail must remain visible on top of the camera body at frame {}".format(frame_index))
+        # Accumulation, not a static strip: a later frame carries more of the path.
+        self.assertGreater(trail_pixels(5), trail_pixels(1))
+        # And nothing is drawn for a single-point path, nor beyond the clip.
+        self.assertEqual(trail_pixels(0), 0)
+        np.testing.assert_array_equal(renderer._trajectory_upto(steps, 2), steps[:3])
+        self.assertEqual(len(renderer._trajectory_upto(steps, 99)), len(steps))
+        gaps = np.asarray([[0.0, 0.0, 0.0], [np.nan, np.nan, np.nan], [0.002, 0.0, 0.004]], dtype=float)
+        np.testing.assert_array_equal(renderer._trajectory_upto(gaps, 2), np.asarray([[0.0, 0.0, 0.0], [0.002, 0.0, 0.004]]))
 
     def test_render_labels_are_english(self):
         source = Path(importlib.import_module("ego_anno.rendering.render_ego_json_overlay").__file__).read_text(encoding="utf-8")
