@@ -494,6 +494,35 @@ def _follow_anchor(pose: np.ndarray, centers: np.ndarray, frame_index: int,
     return smoothed
 
 
+def _look_at_view(eye: np.ndarray, target: np.ndarray, up_hint: np.ndarray) -> dict[str, np.ndarray]:
+    """Build an orthonormal right-handed basis that looks from `eye` at `target`.
+
+    `up_hint` is projected onto the plane perpendicular to the view direction, so
+    the basis stays orthonormal and (right, up, forward) is a genuine camera
+    frame rather than a permuted copy of the source camera axes. A view that is
+    not rigid -- axes permuted, or the eye moved along a non-forward axis while
+    the basis is held fixed -- is an oblique projection: it shears the scene and
+    can invert the on-screen left/right order of the subjects, which is exactly
+    how a left hand ends up drawn to the right of a right hand.
+    """
+    forward = _normalize(np.asarray(target, dtype=np.float64) - np.asarray(eye, dtype=np.float64), np.asarray([0.0, 0.0, 1.0]))
+    hint = np.asarray(up_hint, dtype=np.float64)
+    hint = hint - forward * float(np.dot(hint, forward))
+    if float(np.linalg.norm(hint)) < 1e-6:
+        fallback = np.asarray([0.0, 0.0, 1.0]) if abs(float(forward[2])) < 0.9 else np.asarray([1.0, 0.0, 0.0])
+        hint = fallback - forward * float(np.dot(fallback, forward))
+    up = _normalize(hint, np.asarray([0.0, 0.0, 1.0]))
+    # right = cross(forward, up) is the screen-right axis for this renderer: the
+    # projector maps +x to `right` and flips the `up` component into pixel-y
+    # (camera convention, y down). With up = -down_cam that yields camera +x at
+    # the camera origin, so the world pane agrees with the video pane instead of
+    # being mirrored left/right. The reverse order, cross(up, forward), produces
+    # camera -x and inverts every left/right relationship on screen.
+    right = _normalize(np.cross(forward, up), np.asarray([1.0, 0.0, 0.0]))
+    up = _normalize(np.cross(right, forward), up)
+    return {"right": right, "up": up, "forward": forward}
+
+
 def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, height: int,
                extra_points: np.ndarray | None = None,
                follow_anchor: np.ndarray | None = None) -> dict[str, np.ndarray | float]:
@@ -511,24 +540,30 @@ def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, hei
         merged = np.empty((0, 3), dtype=np.float64)
         median_depth = 0.5
     observer_distance = float(np.clip(0.66 * median_depth, 0.26, 0.44))
-    # True side view (user-reviewed): the observer stands on the camera's left,
-    # perpendicular to its forward axis, slightly above it. The view basis is
-    # camera-relative (screen-right = camera forward, view-forward = camera
-    # right), so the camera profile always sits on the left of the frame
-    # facing its hands on the right, and the view follows without spinning.
+    # `observer_distance` was calibrated as a LATERAL offset scale in the old side
+    # view (it was multiplied by 2.4), so using it raw as a standoff drops the eye
+    # inside the camera prop and auto-framing then shrinks the hands behind it.
+    # The 2.6 factor converts it to an eye-to-anchor standoff: ~0.6-1.1 m for
+    # tabletop scenes, which reproduces the reference screenshot's prop scale
+    # (~1/10 of the pane width) with both hands still large and unoccluded.
+    d = float(np.clip(2.6 * observer_distance, 0.62, 1.10))
+    # Three-quarter rear view (reference screenshot): the observer stands BEHIND
+    # the source camera, a little to its side and a little above it, and looks at
+    # the camera plus both hands. `down_cam` is world-down for this RDF pose, so
+    # the up hint is the camera's own -down axis: the horizon stays level and the
+    # frame follows the camera without spinning about the view axis.
     anchor = center if follow_anchor is None else np.asarray(follow_anchor, dtype=np.float64)
-    eye = (anchor - right * max(2.4 * observer_distance, 0.55)
-           - forward * (0.35 * observer_distance)
-           - down * (0.30 * observer_distance))
+    eye = anchor - forward * (0.9 * d) - right * (0.5 * d) - down * (0.5 * d)
+    target = np.asarray(merged, dtype=np.float64).mean(axis=0) if len(merged) else (anchor + forward * d)
+    basis = _look_at_view(eye, target, -down)
     view: dict[str, np.ndarray | float] = {
         "eye": eye,
-        "right": forward,
-        "up": -down,
-        "forward": right,
-        "focal": float(min(width, height) * 0.9),
+        "right": basis["right"],
+        "up": basis["up"],
+        "forward": basis["forward"],
+        "focal": float(min(width, height)),
         "cx": width * 0.5,
         "cy": height * 0.54,
-        "light": _normalize(-forward - down + right, -forward),
     }
     marker, _ = _camera_marker_points(pose)
     required = np.vstack((marker, merged)) if len(merged) else marker
@@ -543,8 +578,8 @@ def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, hei
         y_min, y_max = float(ny.min()), float(ny.max())
         range_x = max(x_max - x_min, 1e-4)
         range_y = max(y_max - y_min, 1e-4)
-        focal = min(0.85 * width / range_x, 0.85 * height / range_y, 2.8 * min(width, height))
-        focal = max(0.55 * min(width, height), focal)
+        focal = min(0.85 * width / range_x, 0.85 * height / range_y, 1.8 * min(width, height))
+        focal = max(0.45 * min(width, height), focal)
         mean_x = 0.5 * (x_min + x_max)
         mean_y = 0.5 * (y_min + y_max)
         view["focal"] = float(focal)

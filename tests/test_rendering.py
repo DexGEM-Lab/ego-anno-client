@@ -593,13 +593,93 @@ class DagResultTests(unittest.TestCase):
             self.assertTrue(valid.all(), "camera and both hands must be in front of the view")
             self.assertTrue(np.all((pixels[:, 0] >= 0) & (pixels[:, 0] < 640)))
             self.assertTrue(np.all((pixels[:, 1] >= 0) & (pixels[:, 1] < 400)))
-            # True side view: the observer stands on the camera's LEFT (dominant
-            # camera-right offset, negative), slightly behind and above.
+            # Three-quarter rear view: the observer stands behind the camera
+            # (dominant negative forward offset), off to one side and above.
             off = view["eye"] - pose[:3, 3]
-            lateral = float(np.dot(off, pose[:3, 0]))
             rear = float(np.dot(off, pose[:3, 2]))
-            self.assertLess(lateral, 0.0)
-            self.assertGreater(abs(lateral), 5.0 * abs(rear))
+            lateral = float(np.dot(off, pose[:3, 0]))
+            vertical = float(np.dot(off, pose[:3, 1]))
+            self.assertLess(rear, 0.0, "observer must sit behind the camera")
+            self.assertGreater(abs(lateral), 0.0)
+            self.assertLess(vertical, 0.0, "down_cam is +y, so a negative offset is above")
+            self.assertGreater(abs(rear), abs(lateral))
+            self.assertGreater(abs(rear), abs(vertical))
+            # Eye placement follows the spec ratios against the adaptive distance.
+            self.assertAlmostEqual(abs(lateral / rear), 0.5 / 0.9, places=6)
+            self.assertAlmostEqual(abs(vertical / rear), 0.5 / 0.9, places=6)
+
+    def test_view_basis_is_a_rigid_look_at_frame(self):
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        hand = np.asarray(self.document["逐帧轨迹"][0]["帧1"]["手0"]["手部21点坐标"], dtype=float)
+        pose = np.eye(4, dtype=float)
+        pose[:3, 3] = [0.12, -0.05, 0.02]
+        view = renderer._rear_view(pose, [hand + pose[:3, 3]], 640, 400)
+        basis = np.stack([view["right"], view["up"], view["forward"]])
+        np.testing.assert_allclose(basis @ basis.T, np.eye(3), atol=1e-9, err_msg="basis must be orthonormal")
+        # The renderer projects like a pinhole camera (pixel-y is flipped), so the
+        # rigid frame is (right, up, forward) with right = forward x up. This is
+        # the invariant that keeps camera +x on the screen-right; det is -1 by
+        # that convention, which is why the orthonormality check above (not det)
+        # is what proves the view is a rotation, not a shear.
+        np.testing.assert_allclose(np.cross(view["forward"], view["up"]), view["right"], atol=1e-9)
+        # The look direction must point from the eye at the hands, not along a
+        # permuted copy of the camera axes.
+        target = (hand + pose[:3, 3]).mean(axis=0)
+        direction = renderer._normalize(target - view["eye"], np.zeros(3))
+        self.assertGreater(float(np.dot(direction, view["forward"])), 0.9)
+        # Up hint is the camera's own -down axis: the horizon stays level.
+        self.assertLess(float(np.dot(view["up"], pose[:3, 1])), -0.9)
+
+    def test_world_pane_keeps_the_video_pane_left_right_order(self):
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        pose = np.eye(4, dtype=float)
+        pose[:3, 3] = [0.03, 0.01, 0.0]
+        # Asymmetric scene: the anatomical LEFT hand is displaced toward camera
+        # -x (camera-left on the video frame) and forward of the right hand, just
+        # like a real two-hand insert task. Left must land left on screen.
+        left = np.array([[0.05, 0.20, 0.62]] * 21, dtype=float)
+        right = np.array([[0.16, 0.13, 0.60]] * 21, dtype=float)
+        intrinsic = np.asarray(self.document["Metadata"]["相机内参"], dtype=float)
+        view = renderer._rear_view(pose, [left + pose[:3, 3], right + pose[:3, 3]], 640, 400)
+        pixels, _, valid, _ = renderer._project_view(
+            np.vstack((left + pose[:3, 3], right + pose[:3, 3])), view, (640, 400))
+        self.assertTrue(valid.all())
+        left_x = float(pixels[:21, 0].mean())
+        right_x = float(pixels[21:, 0].mean())
+        self.assertLess(left_x, right_x, "world pane must not mirror the hands")
+        # Sanity: the same 3D scene through the real intrinsics really does put
+        # the left hand on the camera-left, i.e. the fixture is anatomically
+        # consistent and the pane is what has to agree with it.
+        video, _, video_valid = renderer._project_camera(
+            renderer._camera_coordinates(np.vstack((left + pose[:3, 3], right + pose[:3, 3])), pose), intrinsic)
+        self.assertTrue(video_valid.all())
+        self.assertLess(float(video[:21, 0].mean()), float(video[21:, 0].mean()))
+        # And the world pane agrees with the video pane about which side is which.
+        self.assertEqual(bool(left_x < right_x), bool(video[:21, 0].mean() < video[21:, 0].mean()))
+
+    def test_world_projection_matches_the_video_pane_through_the_intrinsics(self):
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        intrinsic = np.asarray(self.document["Metadata"]["相机内参"], dtype=float)
+        pose = np.eye(4, dtype=float)
+        for frame in self.document["逐帧轨迹"]:
+            body = frame[list(frame)[0]]
+            world_pose = np.asarray(body["相机世界位姿"], dtype=float)
+            for key in ("手0", "手1"):
+                joints = np.asarray(body[key]["手部21点坐标"], dtype=float)
+                stored = np.asarray(body[key]["手部21点投影坐标"], dtype=float)
+                pixels, _, valid = renderer._project_camera(
+                    renderer._camera_coordinates(joints, world_pose), intrinsic)
+                self.assertTrue(valid.all())
+                # 3D joints re-projected through the stored intrinsics must agree
+                # with the recorded 2D overlay pixels to sub-pixel precision.
+                np.testing.assert_allclose(pixels, stored, atol=1e-6)
+        # The view must not distort that agreement: the camera-relative lateral
+        # ordering of every joint pair survives the world projection.
+        view = renderer._rear_view(pose, [np.asarray(self.document["逐帧轨迹"][0]["帧1"]["手0"]["手部21点坐标"], dtype=float)], 640, 400)
+        self.assertAlmostEqual(float(np.linalg.norm(view["forward"])), 1.0, places=9)
 
     def test_spatial_scene_contains_small_camera_rgb_axes_and_full_trail(self):
         import numpy as np
@@ -619,11 +699,12 @@ class DagResultTests(unittest.TestCase):
                                           [np.full(10, np.nan), np.full(10, np.nan)],
                                           np.asarray(self.document["Metadata"]["相机内参"], dtype=float), (640, 480))
         self.assertEqual(rendered.shape, (400, 640, 3))
-        # Axis arrows + blue full-trail pixels are painted. In a strict profile
-        # view the camera-right (red) arrow points along the view direction and
-        # legitimately foreshortens to a dot, so assert the other two axes.
+        # Axis arrows + blue full-trail pixels are painted. The view is now a
+        # three-quarter rear view, so all three camera axes are visible rather
+        # than one foreshortening to a dot as in the old strict profile.
         self.assertGreater(int(((rendered[:, :, 1] > 120) & (rendered[:, :, 1] > rendered[:, :, 2] * 1.5)).sum()), 20)
         self.assertGreater(int(((rendered[:, :, 0] > 80) & (rendered[:, :, 0] > rendered[:, :, 2] * 1.3) & (rendered[:, :, 0] > rendered[:, :, 1] * 1.3)).sum()), 20)
+        self.assertGreater(int(((rendered[:, :, 2] > 150) & (rendered[:, :, 2] > rendered[:, :, 0] * 1.8) & (rendered[:, :, 2] > rendered[:, :, 1] * 1.8)).sum()), 20)
         # The camera body is intentionally near-black, not the old red prop.
         self.assertGreater(int(((rendered[:, :, 0] < 45) & (rendered[:, :, 1] < 45) & (rendered[:, :, 2] < 45)).sum()), 20)
 
