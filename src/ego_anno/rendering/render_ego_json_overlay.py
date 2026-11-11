@@ -371,7 +371,13 @@ def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, hei
     observer_distance = float(np.clip(0.66 * median_depth, 0.26, 0.44))
     # Slightly above the camera axis. In camera coordinates +y is image down,
     # so moving by -down raises the observer.
-    eye = center - forward * observer_distance - down * (0.20 * observer_distance)
+    # Stand to the camera's right while remaining behind and slightly above it.
+    # The camera basis is used directly, so this is a stable side-rear follow
+    # view rather than a world-up orbit that can spin as the camera moves.
+    lateral_offset = 0.42
+    eye = (center - forward * observer_distance
+           + right * (lateral_offset * observer_distance)
+           - down * (0.20 * observer_distance))
     view: dict[str, np.ndarray | float] = {
         "eye": eye,
         "right": right,
@@ -440,7 +446,7 @@ def _text_font(size: int):
     candidates = (
         # Full-coverage CJK+Latin font first: the bundled fonts and
         # DroidSansFallbackFull are CJK-only subsets whose Latin glyphs render
-        # as tofu boxes in mixed strings (e.g. "手部姿态overlay").
+        # as tofu boxes in mixed strings; rendered labels are English-only.
         Path.home() / ".fonts" / "NotoSansCJKsc-Regular.ttf",
         Path(__file__).resolve().parent / "fonts" / "NotoSansCJK-Regular.ttc",
         Path(__file__).resolve().parent / "fonts" / "NotoSansCJK-Regular.otf",
@@ -710,7 +716,7 @@ def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, 
     # Draw the camera last so it covers hand pixels at every 2D overlap.
     # Painter order gives the requested hierarchy without slow depth rasterization.
     _draw_camera_marker(canvas, pose, view)
-    cv2.putText(canvas, "rear overhead view: camera-relative depth order", (16, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (245, 245, 245), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "side-rear follow view: camera and hands", (16, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (245, 245, 245), 2, cv2.LINE_AA)
     cv2.putText(canvas, f"frame {frame_index + 1:06d} | camera right/down/forward coordinates | units: meters", (16, height - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (225, 232, 240), 1, cv2.LINE_AA)
     skeleton_visible = any(
         meshes[side] is None and np.isfinite(frame_joints[side]).all()
@@ -855,8 +861,8 @@ def main() -> int:
             canvas[:pane_height, :pane_width] = _resize_to_contain(source, pane_width, pane_height)
             canvas[:pane_height, pane_width:pane_width * 2] = world
             title_size = max(30, int(round(pane_height * 0.043)))
-            left_title = "Hand joints overlay" if _is_cosmos(document) else "手部姿态overlay"
-            right_title = "Camera and hands in 3D" if _is_cosmos(document) else "相机-手 世界坐标位姿"
+            left_title = "Hand joints overlay"
+            right_title = "Camera and hands: side-rear follow view"
             _put_text_mixed(canvas, left_title, (24, 64), title_size, (255, 255, 255), 2)
             _put_text_mixed(canvas, right_title, (pane_width + 24, 64), title_size, (255, 255, 255), 2)
             _draw_subtitle(canvas, structured, narrative, frame_index, frame_count, band_height)

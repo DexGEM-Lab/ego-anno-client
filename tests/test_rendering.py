@@ -579,6 +579,31 @@ class DagResultTests(unittest.TestCase):
                 rendering.render_video_result(self.result, self.video, protected)
             self.assertEqual(protected.read_bytes(), b"keep")
 
+    def test_side_rear_follow_view_frames_camera_and_hands_across_motion(self):
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        hand = np.asarray(self.document["逐帧轨迹"][0]["帧1"]["手0"]["手部21点坐标"], dtype=float)
+        for translation in (0.0, 0.8, -0.6):
+            pose = np.eye(4, dtype=float)
+            pose[:3, 3] = [translation, 0.0, 0.0]
+            view = renderer._rear_view(pose, [hand + pose[:3, 3], hand + pose[:3, 3]], 640, 400)
+            marker, _ = renderer._camera_marker_points(pose)
+            points = np.vstack((marker, hand + pose[:3, 3], hand + pose[:3, 3]))
+            pixels, _, valid, _ = renderer._project_view(points, view, (640, 400))
+            self.assertTrue(valid.all(), "camera and both hands must be in front of the view")
+            self.assertTrue(np.all((pixels[:, 0] >= 0) & (pixels[:, 0] < 640)))
+            self.assertTrue(np.all((pixels[:, 1] >= 0) & (pixels[:, 1] < 400)))
+            # The lateral offset is in the camera-right basis, with no world-up spin.
+            self.assertGreater(float(np.dot(view["eye"] - pose[:3, 3], pose[:3, 0])), 0.0)
+
+    def test_render_labels_are_english(self):
+        source = Path(importlib.import_module("ego_anno.rendering.render_ego_json_overlay").__file__).read_text(encoding="utf-8")
+        self.assertIn("Hand joints overlay", source)
+        self.assertIn("Camera and hands: side-rear follow view", source)
+        self.assertIn("side-rear follow view: camera and hands", source)
+        self.assertNotIn("手部姿态overlay", source)
+        self.assertNotIn("相机-手 世界坐标位姿", source)
+
     def test_command_line_requires_exactly_one_input_form(self):
         from ego_anno import cli
         base = ["render", "--result", "r.json", "-o", "out.mp4"]
