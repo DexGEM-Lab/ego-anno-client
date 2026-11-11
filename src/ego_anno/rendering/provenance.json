@@ -7,7 +7,7 @@
     {
       "source_path": "clusters/py312/render/src/render_pack/render_ego_json_overlay.py",
       "vendored_path": "render_ego_json_overlay.py",
-      "sha256": "c38f6ab6915741d7d4544644fce22862c393e6337caae8bb02a1cc28d0cbd94b"
+      "sha256": "8b4593c44aee0dcae86ef0ea3eb96e71a6aeac55edd6c26f7319798baa5a5504"
     },
     {
       "source_path": "clusters/py312/render/src/render_pack/cosmos_e2e.py",

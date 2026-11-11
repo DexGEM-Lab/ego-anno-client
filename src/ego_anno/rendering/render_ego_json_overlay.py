@@ -39,11 +39,19 @@ HAND_EDGES = (
 # RRD constants are RGB; OpenCV rasterizes them as BGR.
 HAND_COLORS = ((90, 225, 70), (40, 205, 255))  # left green, right yellow
 KEYPOINT_COLOR = (40, 40, 255)                 # RRD KEYPOINT_RGBA red
-SKIN_COLOR = (160, 205, 240)                   # RRD SKIN_RGBA
-CAMERA_COLOR = (40, 40, 220)                   # RRD CAM_RGBA
-TRAIL_COLOR = (255, 180, 60)                   # RRD TRAIL_RGBA
-GRID_COLOR = (215, 205, 200)                  # RRD GRID_RGBA converted to BGR
-BG = (26, 29, 33)
+SKIN_COLOR = (160, 205, 240)                   # RRD SKIN_RGBA [240, 205, 160]
+CAMERA_COLOR = (22, 25, 28)                   # near-black cinema camera (BGR)
+TRAIL_COLOR = (255, 180, 60)                   # RRD TRAIL_RGBA [60, 180, 255]
+GRID_COLOR = (91, 89, 83)                     # sampled bright grid core, BGR
+# Rerun's spatial viewport is a dark blue-green shaded floor rather than the
+# neutral gray used by the old overlay.  Corners are sampled from the target
+# view (stored here as BGR because OpenCV owns the raster).
+BG = (24, 52, 24)
+_SPATIAL_BG_CORNERS = np.asarray((
+    ((16, 45, 30), (29, 44, 16)),
+    ((20, 56, 32), (34, 55, 22)),
+), dtype=np.float64)
+AXIS_COLORS = {(0, 5): (50, 70, 235), (0, 6): (50, 220, 90), (0, 7): (235, 100, 55)}
 OUTLINE = (3, 3, 3)
 
 # MANO's 16 kinematic joints mapped to the JSON/OpenPose-style 21-joint order.
@@ -427,40 +435,7 @@ def _build_cinema_camera(s: float = 0.07) -> tuple[np.ndarray, np.ndarray]:
     return np.asarray(verts, dtype=np.float64), np.asarray(faces, dtype=np.int32)
 
 
-def _camera_frustum_points(pose: np.ndarray, intrinsic: np.ndarray, source_size: tuple[int, int], depth: float = 0.18) -> np.ndarray:
-    """Return camera center, optical axis and far pinhole corners in world RDF coordinates."""
-    width, height = source_size
-    intrinsic = np.asarray(intrinsic, dtype=np.float64)
-    if not np.isfinite(intrinsic).all() or intrinsic.shape != (3, 3):
-        focal_x = focal_y = max(width, height)
-        cx, cy = width * 0.5, height * 0.5
-    else:
-        focal_x, focal_y = float(intrinsic[0, 0]), float(intrinsic[1, 1])
-        cx, cy = float(intrinsic[0, 2]), float(intrinsic[1, 2])
-        if focal_x <= 1e-6 or focal_y <= 1e-6:
-            focal_x = focal_y = max(width, height)
-    pixels = np.asarray(((0, 0), (width, 0), (width, height), (0, height)), dtype=np.float64)
-    camera = np.column_stack(((pixels[:, 0] - cx) * depth / focal_x,
-                              (pixels[:, 1] - cy) * depth / focal_y,
-                              np.full(4, depth)))
-    center = np.asarray(pose[:3, 3], dtype=np.float64)
-    rotation = np.asarray(pose[:3, :3], dtype=np.float64)
-    corners = (rotation @ camera.T).T + center
-    return np.vstack((center, center + rotation[:, 2] * depth, corners))
-
-
-def _draw_frustum(canvas: np.ndarray, pose: np.ndarray, intrinsic: np.ndarray,
-                  source_size: tuple[int, int], view: dict[str, np.ndarray | float]) -> None:
-    points = _camera_frustum_points(pose, intrinsic, source_size)
-    center, axis, corners = points[0], points[1], points[2:]
-    for endpoint in corners:
-        _draw_view_line(canvas, np.asarray((center, endpoint)), view, CAMERA_COLOR, 2)
-    for index in range(4):
-        _draw_view_line(canvas, np.asarray((corners[index], corners[(index + 1) % 4])), view, CAMERA_COLOR, 2)
-    _draw_view_line(canvas, np.asarray((center, axis)), view, CAMERA_COLOR, 2)
-
-
-def _camera_marker_points(pose: np.ndarray, scale: float = 0.026) -> tuple[np.ndarray, list[tuple[int, int]]]:
+def _camera_marker_points(pose: np.ndarray, scale: float = 0.032) -> tuple[np.ndarray, list[tuple[int, int]]]:
     center = np.asarray(pose[:3, 3], dtype=np.float64)
     rotation = np.asarray(pose[:3, :3], dtype=np.float64)
     x_axis, down_axis, forward = rotation[:, 0], rotation[:, 1], rotation[:, 2]
@@ -480,14 +455,15 @@ def _camera_marker_points(pose: np.ndarray, scale: float = 0.026) -> tuple[np.nd
 def _draw_camera_marker(canvas: np.ndarray, pose: np.ndarray, view: dict[str, np.ndarray | float]) -> None:
     points, edges = _camera_marker_points(pose)
     pixels, _, valid, _ = _project_view(points, view, (canvas.shape[1], canvas.shape[0]))
-    axis_colors = {(0, 5): CAMERA_COLOR, (0, 6): CAMERA_COLOR, (0, 7): CAMERA_COLOR}
     for a, b in edges:
         if not (valid[a] and valid[b]):
             continue
-        color = axis_colors.get((a, b), CAMERA_COLOR)
+        color = AXIS_COLORS.get((a, b), CAMERA_COLOR)
         pa, pb = tuple(np.rint(pixels[a]).astype(int)), tuple(np.rint(pixels[b]).astype(int))
-        cv2.line(canvas, pa, pb, OUTLINE, 4, cv2.LINE_AA)
-        cv2.line(canvas, pa, pb, color, 2, cv2.LINE_AA)
+        # Keep the camera marker subordinate to the dark body, while making
+        # the three short RGB direction arrows legible at the camera origin.
+        width = 3 if (a, b) in AXIS_COLORS else 2
+        cv2.arrowedLine(canvas, pa, pb, color, width, cv2.LINE_AA, tipLength=0.28)
 
 
 def _follow_anchor(pose: np.ndarray, centers: np.ndarray, frame_index: int,
@@ -578,6 +554,15 @@ def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, hei
     return view
 
 
+def _spatial_background(width: int, height: int) -> np.ndarray:
+    """Build the sampled dark blue-green spatial-view background in BGR."""
+    x = np.linspace(0.0, 1.0, max(width, 1), dtype=np.float64)[None, :, None]
+    y = np.linspace(0.0, 1.0, max(height, 1), dtype=np.float64)[:, None, None]
+    top = (1.0 - x) * _SPATIAL_BG_CORNERS[0, 0] + x * _SPATIAL_BG_CORNERS[0, 1]
+    bottom = (1.0 - x) * _SPATIAL_BG_CORNERS[1, 0] + x * _SPATIAL_BG_CORNERS[1, 1]
+    return np.rint((1.0 - y) * top + y * bottom).astype(np.uint8)
+
+
 def _draw_camera_grid(canvas: np.ndarray, pose: np.ndarray, joints: list[np.ndarray],
                       view: dict[str, np.ndarray | float]) -> None:
     """Rasterize render_rerun.py's fixed faint RDF ground grid.
@@ -593,7 +578,9 @@ def _draw_camera_grid(canvas: np.ndarray, pose: np.ndarray, joints: list[np.ndar
         grid_lines.append(np.asarray(((gx, grid_y, -2.0), (gx, grid_y, 2.0)), dtype=np.float64))
     for gz in np.arange(-2.0, 2.25, 0.5):
         grid_lines.append(np.asarray(((-2.0, grid_y, gz), (2.0, grid_y, gz)), dtype=np.float64))
-    alpha = 40.0 / 255.0
+    # The target view uses a crisp, one-pixel neutral grid; antialiasing keeps
+    # diagonals smooth while retaining the sampled bright line core.
+    alpha = 0.92
     for points in grid_lines:
         pixels, _, valid, _ = _project_view(points, view, (canvas.shape[1], canvas.shape[0]))
         if not valid.all():
@@ -674,15 +661,15 @@ def _wrap_text(text: str, font: int, scale: float, thickness: int, max_width: in
 
 
 def _draw_subtitle(canvas: np.ndarray, structured: str, narrative: str, frame_index: int, frame_count: int, band_height: int) -> None:
+    """Draw only the natural-language description in the bottom strip."""
+    del structured, frame_index, frame_count
     height, width = canvas.shape[:2]
     y0 = height - band_height
     layer = canvas.copy()
     cv2.rectangle(layer, (0, y0), (width, height), (0, 0, 0), -1)
     cv2.addWeighted(layer, 0.72, canvas, 0.28, 0.0, canvas)
-    cv2.putText(canvas, f"frame {frame_index + 1:06d}/{frame_count}", (18, y0 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (190, 215, 255), 1, cv2.LINE_AA)
-    cv2.putText(canvas, structured, (18, y0 + 56), cv2.FONT_HERSHEY_SIMPLEX, 0.61, (112, 235, 255), 1, cv2.LINE_AA)
     lines = _wrap_text(narrative, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 1, width - 36)
-    y = y0 + 88
+    y = y0 + 42
     for line in lines[:3]:
         cv2.putText(canvas, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (248, 248, 248), 1, cv2.LINE_AA)
         y += 27
@@ -695,24 +682,19 @@ def _subtitle_for_frame(rows: list[dict], frame_index: int, cursor: int, *, cosm
             if frame_index == 0 else
             "Predicted 3D joints; hand visibility and object labels are not provided."
         )
-        return "Cosmos | green=left, yellow=right | skeleton only (no beta)", detail, cursor
+        return "", detail, cursor
     frame_number = frame_index + 1
     while cursor < len(rows) and frame_number > int(rows[cursor]["起始帧"][1]):
         cursor += 1
     if cursor >= len(rows):
-        return "left hand: none, right hand: none", "", cursor
+        return "", "", cursor
     row = rows[cursor]
     start, end = (int(value) for value in row["起始帧"])
     if not (start <= frame_number <= end):
-        return "left hand: none, right hand: none", "", cursor
+        return "", "", cursor
 
-    def object_text(value: object) -> str:
-        text = str(value).strip() if value is not None else ""
-        return text if text else "none"
-
-    structured = f"left hand: {object_text(row.get('左手物体'))}, right hand: {object_text(row.get('右手物体'))}"
     narrative = str(row.get("总体描述") or "").strip()
-    return structured, narrative, cursor
+    return "", narrative, cursor
 
 
 def _load_document(path: Path, camera_path: Path | None = None) -> tuple[dict, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray]:
@@ -869,24 +851,18 @@ def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, 
                   frame_betas: list[np.ndarray] | None = None, intrinsic: np.ndarray | None = None,
                   source_size: tuple[int, int] | None = None) -> np.ndarray:
     width, height = size
-    canvas = np.full((height, width, 3), BG, dtype=np.uint8)
-    cam_verts, cam_faces = _build_cinema_camera()
+    canvas = _spatial_background(width, height)
+    # Keep the reference cinema-camera proportions, but make the object small
+    # enough to read as a spatial-view anchor rather than a dominant prop.
+    cam_verts, cam_faces = _build_cinema_camera(s=0.055)
     cam_world = (np.asarray(pose[:3, :3], dtype=np.float64) @ cam_verts.T).T + pose[:3, 3]
-    # Frame the camera body and hands; the frustum is an explanatory overlay and
-    # may extend toward the image border without making both subjects tiny.
+    # Frame the camera body and hands with the stable side-rear follow view.
     follow_anchor = _follow_anchor(pose, centers, frame_index, frame_joints)
     view = _rear_view(pose, frame_joints, width, height, cam_world, follow_anchor)
     _draw_camera_grid(canvas, pose, frame_joints, view)
     trajectory = centers[np.isfinite(centers).all(axis=1)]
 
-    # Match the RRD world content: a solid red cinema-camera mesh and red
-    # pinhole/frustum lines. Rerun's Mesh3D has no hand-drawn black edges.
-    pixels, _, _, xyz = _project_view(cam_world, view, (width, height))
-    _draw_mesh_pixels(canvas, pixels, xyz, cam_faces, CAMERA_COLOR, alpha=1.0, edges=False)
-    if intrinsic is not None and source_size is not None:
-        _draw_frustum(canvas, pose, intrinsic, source_size, view)
-    # Keep the static trajectory readable when it passes through the current
-    # camera body; this is the raster equivalent of Rerun's depth-tested trail.
+    # Draw the blue trail behind the current objects, as in the spatial view.
     if len(trajectory) >= 2:
         _draw_view_line(canvas, trajectory, view, TRAIL_COLOR, 2)
 
@@ -902,20 +878,11 @@ def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, 
         elif frame_betas is None or not _has_beta(frame_betas[side]):
             _draw_world_skeleton(canvas, joints_world, view, HAND_COLORS[side])
 
-    # Painter order matches the spatial view: camera geometry is the anchor and
-    # hands remain readable where the two objects overlap.
-    cv2.putText(canvas, "side-rear follow view: camera and hands", (16, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (245, 245, 245), 2, cv2.LINE_AA)
-    cv2.putText(canvas, f"frame {frame_index + 1:06d} | camera right/down/forward coordinates | units: meters", (16, height - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (225, 232, 240), 1, cv2.LINE_AA)
-    skeleton_visible = any(
-        meshes[side] is None and np.isfinite(frame_joints[side]).all()
-        and (frame_betas is None or not _has_beta(frame_betas[side]))
-        for side in range(2)
-    )
-    legend = (
-        "red=camera | blue=past path | green/yellow=joints"
-        if skeleton_visible else "red=camera | blue=past path | skin=hands"
-    )
-    cv2.putText(canvas, legend, (16, height - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (205, 215, 226), 1, cv2.LINE_AA)
+    # Painter order matches the spatial view: the camera is the anchor and its
+    # small RGB axis arrows sit on top of the dark body.
+    pixels, _, _, xyz = _project_view(cam_world, view, (width, height))
+    _draw_mesh_pixels(canvas, pixels, xyz, cam_faces, CAMERA_COLOR, alpha=1.0, edges=False)
+    _draw_camera_marker(canvas, pose, view)
     return canvas
 
 
