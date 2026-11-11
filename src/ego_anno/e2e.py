@@ -1,19 +1,22 @@
-"""Local preprocessing for ``pipeline=e2e`` (Cosmos3 hand147) submissions.
+"""Local preprocessing for ``pipeline=e2e`` (Cosmos3 hand+head) submissions.
 
-The service accepts only constant 15 fps H.264 clips of 17..241 frames with
-(N - 1) % 4 == 0 and a short side of 640..1080 pixels. This module turns a
-15..30 fps source of at most 20 s into such a clip with the system ``ffprobe``
-and ``ffmpeg`` binaries (standard library subprocesses only):
+The service accepts constant 15 fps H.264 clips of 31..9001 frames (about 2 s
+to 10 minutes) with a short side of 640..1080 pixels; too long is rejected,
+never trimmed. This module turns a 15..30 fps source into such a clip with
+the system ``ffprobe`` and ``ffmpeg`` binaries (standard library subprocesses
+only):
 
 1. Probe the source: displayed size (rotation metadata applied), average frame
-   rate, duration, and every decoded frame's ``best_effort_timestamp_time``.
-2. Reject > 30 fps, < 15 fps (both within 1e-3), > 20 s, and short sides
-   outside 640..1440.
+   rate, duration (informational only; container metadata such as nb_frames or
+   duration may be wrong, so no limit ever reads it), and every decoded
+   frame's ``best_effort_timestamp_time``.
+2. Reject > 30 fps, < 15 fps (both within 1e-3), and short sides outside
+   640..1440. Length is governed by the resampled frame count from decoded
+   frame timestamps alone, never by container duration or header frame counts.
 3. Resample to 15 fps by timestamp: output slot k (time t0 + k/15, kept while
    it is before the source end, last timestamp + 1/fps) shows the source frame
-   whose timestamp is nearest (the earlier one on a tie). Keep the first
-   min(241, slots) slots, trim to the largest N with (N - 1) % 4 == 0, and
-   reject N < 17.
+   whose timestamp is nearest (the earlier one on a tie). Keep every slot and
+   reject the video when there are fewer than 31 or more than 9001.
 4. Decode only the chosen source frames with the ffmpeg video filter
    ``select=<balanced sum of not(n-index) terms>,<geometry>,format=yuv420p``
    (``-fps_mode passthrough`` or legacy ``-vsync passthrough``, raw yuv420p to a pipe; ``n`` is the decode-order
@@ -45,9 +48,8 @@ TARGET_FPS = 15
 MIN_FPS = 15
 MAX_FPS = 30
 FPS_TOLERANCE = 1e-3
-MAX_DURATION_SECONDS = 20.0
-MIN_FRAMES = 17
-MAX_FRAMES = 241
+MIN_FRAMES = 31
+MAX_FRAMES = 9001
 MIN_SHORT_SIDE = 640
 MAX_KEPT_SHORT_SIDE = 1080
 MAX_SHORT_SIDE = 1440
@@ -74,15 +76,16 @@ def check_prompt(prompt):
 
 
 def check_source(fps, duration, width, height):
-    """Apply the client admission rules to the probed source (displayed size)."""
+    """Apply the client admission rules to the probed source (displayed size).
+
+    ``duration`` is accepted for reporting only: container metadata can lie
+    (a video whose header claims one frame may decode thousands), so admission
+    never reads it. The decoded frame count decides length.
+    """
     if not (isinstance(fps, (int, float)) and math.isfinite(fps) and fps > 0):
         raise ClientError("cannot determine the video frame rate")
     if fps > MAX_FPS + FPS_TOLERANCE or fps < MIN_FPS - FPS_TOLERANCE:
         raise ClientError("e2e accepts 15 to 30 fps; the video is {:.3f} fps".format(fps))
-    if not (isinstance(duration, (int, float)) and math.isfinite(duration) and duration > 0):
-        raise ClientError("cannot determine the video duration")
-    if duration > MAX_DURATION_SECONDS:
-        raise ClientError("e2e accepts videos of at most 20 s; the video is {:.3f} s".format(duration))
     if not MIN_SHORT_SIDE <= min(width, height) <= MAX_SHORT_SIDE:
         raise ClientError("e2e requires a short side of 640 to 1440 pixels; the video is {}x{}".format(
             width, height))
@@ -110,14 +113,14 @@ def slot_count(timestamps, end):
 
 
 def frame_count(available):
-    """First min(241, available) slots trimmed to (N - 1) % 4 == 0; N >= 17."""
-    count = min(MAX_FRAMES, available)
-    if count >= 1:
-        count -= (count - 1) % 4
-    if count < MIN_FRAMES:
-        raise ClientError("e2e needs at least {} frames at 15 fps (about 1.07 s); the video yields {}".format(
+    """Every slot is kept; 31..9001 frames (about 2 s to 10 minutes at 15 fps)."""
+    if available < MIN_FRAMES:
+        raise ClientError("e2e needs at least {} frames at 15 fps (about 2 s); the video yields {}".format(
             MIN_FRAMES, available))
-    return count
+    if available > MAX_FRAMES:
+        raise ClientError("e2e accepts at most {} frames at 15 fps (10 minutes); the video yields {}".format(
+            MAX_FRAMES, available))
+    return available
 
 
 def nearest_indices(timestamps, count):
@@ -434,8 +437,10 @@ def preprocess(video, workdir, camera=None):
     end = timestamps[-1] + 1 / source.fps
     num_frames = frame_count(slot_count(timestamps, end))
     indices = nearest_indices(timestamps, num_frames)
-    print("e2e preprocessing: {}x{} {:.3f} fps {:.3f} s -> {} frames at 15 fps {}x{}".format(
-        source.width, source.height, source.fps, source.duration, num_frames,
+    duration = "{:.3f} s".format(source.duration) if isinstance(source.duration, (int, float)) \
+        and math.isfinite(source.duration) else "unknown duration"
+    print("e2e preprocessing: {}x{} {:.3f} fps {} -> {} frames at 15 fps {}x{}".format(
+        source.width, source.height, source.fps, duration, num_frames,
         geometry.width, geometry.height), file=sys.stderr, flush=True)
     transcode(ffmpeg, video, output, indices, source.width, source.height, geometry)
     verify_output(ffprobe, output, num_frames, geometry)

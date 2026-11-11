@@ -23,7 +23,7 @@ class SavedInputTests(unittest.TestCase):
         self.source = self.root / "original.mp4"
         subprocess.run([
             "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
-            "color=c=blue:s=640x640:r=15:d=2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "color=c=blue:s=640x640:r=15:d=2.2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
             str(self.source),
         ], check=True)
         self.key = "test-sensitive-key-not-for-persistence"
@@ -46,19 +46,19 @@ class SavedInputTests(unittest.TestCase):
         meta = json.loads((destination / "submission.json").read_text())
         self.assertEqual(meta["annotation_job_id"], self.job)
         self.assertEqual(meta["idempotency_key"], self.idem)
-        self.assertEqual(meta["num_frames"], 29)
+        self.assertEqual(meta["num_frames"], 33)
         self.assertEqual(meta["fps"], 15)
         self.assertEqual(json.loads((destination / "camera.json").read_text()), self.camera)
         self.assertNotIn(self.key, (destination / "submission.json").read_text())
         # The original TemporaryDirectory is gone: the durable video still decodes
-        # and has the timeline expected by the downloaded 28-row action output.
+        # and has the timeline expected by the downloaded 32-row action output.
         probe = subprocess.run([
             "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
             "-show_entries", "stream=nb_read_frames,width,height,r_frame_rate", "-of", "json",
             str(destination / "video.mp4"),
         ], check=True, capture_output=True, text=True)
         stream = json.loads(probe.stdout)["streams"][0]
-        self.assertEqual((stream["nb_read_frames"], stream["width"], stream["height"]), ("29", 640, 640))
+        self.assertEqual((stream["nb_read_frames"], stream["width"], stream["height"]), ("33", 640, 640))
         self.assertEqual(stream["r_frame_rate"], "15/1")
 
     def test_failed_submission_preserves_inputs_and_retry_identity_without_false_job_id(self):
