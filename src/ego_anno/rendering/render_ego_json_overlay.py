@@ -511,25 +511,24 @@ def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, hei
         merged = np.empty((0, 3), dtype=np.float64)
         median_depth = 0.5
     observer_distance = float(np.clip(0.66 * median_depth, 0.26, 0.44))
-    # Slightly above the camera axis. In camera coordinates +y is image down,
-    # so moving by -down raises the observer.
-    # Stand to the camera's right while remaining behind and slightly above it.
-    # The camera basis is used directly, so this is a stable side-rear follow
-    # view rather than a world-up orbit that can spin as the camera moves.
-    lateral_offset = 0.42
+    # True side view (user-reviewed): the observer stands on the camera's left,
+    # perpendicular to its forward axis, slightly above it. The view basis is
+    # camera-relative (screen-right = camera forward, view-forward = camera
+    # right), so the camera profile always sits on the left of the frame
+    # facing its hands on the right, and the view follows without spinning.
     anchor = center if follow_anchor is None else np.asarray(follow_anchor, dtype=np.float64)
-    eye = (anchor - forward * observer_distance
-           + right * (lateral_offset * observer_distance)
-           - down * (0.20 * observer_distance))
+    eye = (anchor - right * max(2.4 * observer_distance, 0.55)
+           - forward * (0.35 * observer_distance)
+           - down * (0.30 * observer_distance))
     view: dict[str, np.ndarray | float] = {
         "eye": eye,
-        "right": right,
+        "right": forward,
         "up": -down,
-        "forward": forward,
+        "forward": right,
         "focal": float(min(width, height) * 0.9),
         "cx": width * 0.5,
         "cy": height * 0.54,
-        "light": _normalize(-forward - down, -forward),
+        "light": _normalize(-forward - down + right, -forward),
     }
     marker, _ = _camera_marker_points(pose)
     required = np.vstack((marker, merged)) if len(merged) else marker
@@ -544,8 +543,8 @@ def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, hei
         y_min, y_max = float(ny.min()), float(ny.max())
         range_x = max(x_max - x_min, 1e-4)
         range_y = max(y_max - y_min, 1e-4)
-        focal = min(0.58 * width / range_x, 0.50 * height / range_y, 2.8 * min(width, height))
-        focal = max(0.20 * min(width, height), focal)
+        focal = min(0.85 * width / range_x, 0.85 * height / range_y, 2.8 * min(width, height))
+        focal = max(0.55 * min(width, height), focal)
         mean_x = 0.5 * (x_min + x_max)
         mean_y = 0.5 * (y_min + y_max)
         view["focal"] = float(focal)
@@ -854,7 +853,7 @@ def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, 
     canvas = _spatial_background(width, height)
     # Keep the reference cinema-camera proportions, but make the object small
     # enough to read as a spatial-view anchor rather than a dominant prop.
-    cam_verts, cam_faces = _build_cinema_camera(s=0.055)
+    cam_verts, cam_faces = _build_cinema_camera(s=0.085)
     cam_world = (np.asarray(pose[:3, :3], dtype=np.float64) @ cam_verts.T).T + pose[:3, 3]
     # Frame the camera body and hands with the stable side-rear follow view.
     follow_anchor = _follow_anchor(pose, centers, frame_index, frame_joints)

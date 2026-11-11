@@ -593,8 +593,13 @@ class DagResultTests(unittest.TestCase):
             self.assertTrue(valid.all(), "camera and both hands must be in front of the view")
             self.assertTrue(np.all((pixels[:, 0] >= 0) & (pixels[:, 0] < 640)))
             self.assertTrue(np.all((pixels[:, 1] >= 0) & (pixels[:, 1] < 400)))
-            # The lateral offset is in the camera-right basis, with no world-up spin.
-            self.assertGreater(float(np.dot(view["eye"] - pose[:3, 3], pose[:3, 0])), 0.0)
+            # True side view: the observer stands on the camera's LEFT (dominant
+            # camera-right offset, negative), slightly behind and above.
+            off = view["eye"] - pose[:3, 3]
+            lateral = float(np.dot(off, pose[:3, 0]))
+            rear = float(np.dot(off, pose[:3, 2]))
+            self.assertLess(lateral, 0.0)
+            self.assertGreater(abs(lateral), 5.0 * abs(rear))
 
     def test_spatial_scene_contains_small_camera_rgb_axes_and_full_trail(self):
         import numpy as np
@@ -614,9 +619,11 @@ class DagResultTests(unittest.TestCase):
                                           [np.full(10, np.nan), np.full(10, np.nan)],
                                           np.asarray(self.document["Metadata"]["相机内参"], dtype=float), (640, 480))
         self.assertEqual(rendered.shape, (400, 640, 3))
-        # RGB axis arrows/keypoints and blue full-trail pixels are painted.
-        self.assertGreater(int(((rendered[:, :, 2] > 120) & (rendered[:, :, 2] > rendered[:, :, 1] * 1.5)).sum()), 20)
-        self.assertGreater(int(((rendered[:, :, 0] > 80) & (rendered[:, :, 2] > 80)).sum()), 20)
+        # Axis arrows + blue full-trail pixels are painted. In a strict profile
+        # view the camera-right (red) arrow points along the view direction and
+        # legitimately foreshortens to a dot, so assert the other two axes.
+        self.assertGreater(int(((rendered[:, :, 1] > 120) & (rendered[:, :, 1] > rendered[:, :, 2] * 1.5)).sum()), 20)
+        self.assertGreater(int(((rendered[:, :, 0] > 80) & (rendered[:, :, 0] > rendered[:, :, 2] * 1.3) & (rendered[:, :, 0] > rendered[:, :, 1] * 1.3)).sum()), 20)
         # The camera body is intentionally near-black, not the old red prop.
         self.assertGreater(int(((rendered[:, :, 0] < 45) & (rendered[:, :, 1] < 45) & (rendered[:, :, 2] < 45)).sum()), 20)
 
