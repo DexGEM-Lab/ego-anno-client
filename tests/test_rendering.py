@@ -586,7 +586,10 @@ class DagResultTests(unittest.TestCase):
         for translation in (0.0, 0.8, -0.6):
             pose = np.eye(4, dtype=float)
             pose[:3, 3] = [translation, 0.0, 0.0]
-            view = renderer._rear_view(pose, [hand + pose[:3, 3], hand + pose[:3, 3]], 640, 400)
+            cam_verts, _ = renderer._build_cinema_camera(s=0.085)
+            view = renderer._static_follow_view(np.asarray([pose]), np.asarray([True]),
+                                                [hand + pose[:3, 3], hand + pose[:3, 3]],
+                                                cam_verts, 640, 400)
             marker, _ = renderer._camera_marker_points(pose)
             points = np.vstack((marker, hand + pose[:3, 3], hand + pose[:3, 3]))
             pixels, _, valid, _ = renderer._project_view(points, view, (640, 400))
@@ -605,6 +608,8 @@ class DagResultTests(unittest.TestCase):
             self.assertGreater(abs(rear), abs(lateral))
             self.assertGreater(abs(rear), abs(vertical))
             # Eye placement follows the spec ratios against the adaptive distance.
+            # `pose` is the only pose in the clip, so the clip-median anchor is
+            # this camera centre and the ratios hold exactly.
             self.assertAlmostEqual(abs(lateral / rear), 0.5 / 0.9, places=6)
             self.assertAlmostEqual(abs(vertical / rear), renderer._EYE_ELEVATION / 0.9, places=6)
             # Elevation above the anchor's horizontal plane is the one knob the
@@ -623,7 +628,9 @@ class DagResultTests(unittest.TestCase):
         hand = np.asarray(self.document["逐帧轨迹"][0]["帧1"]["手0"]["手部21点坐标"], dtype=float)
         pose = np.eye(4, dtype=float)
         pose[:3, 3] = [0.12, -0.05, 0.02]
-        view = renderer._rear_view(pose, [hand + pose[:3, 3]], 640, 400)
+        cam_verts, _ = renderer._build_cinema_camera(s=0.085)
+        view = renderer._static_follow_view(np.asarray([pose]), np.asarray([True]), [hand + pose[:3, 3]],
+                                            cam_verts, 640, 400)
         basis = np.stack([view["right"], view["up"], view["forward"]])
         np.testing.assert_allclose(basis @ basis.T, np.eye(3), atol=1e-9, err_msg="basis must be orthonormal")
         # The renderer projects like a pinhole camera (pixel-y is flipped), so the
@@ -637,8 +644,29 @@ class DagResultTests(unittest.TestCase):
         target = (hand + pose[:3, 3]).mean(axis=0)
         direction = renderer._normalize(target - view["eye"], np.zeros(3))
         self.assertGreater(float(np.dot(direction, view["forward"])), 0.9)
-        # Up hint is the camera's own -down axis: the horizon stays level.
-        self.assertLess(float(np.dot(view["up"], pose[:3, 1])), -0.9)
+        # Up hint is the camera's own -down axis, projected perpendicular to the
+        # view direction, so the dot with -down is cos(pitch) rather than ~1:
+        # the 33 deg elevation tilts `up` off world-vertical by that same angle.
+        # Note the oblique 3/4 view legitimately gives `up` a nonzero camera-x
+        # component, so that is NOT a roll test.
+        self.assertLess(float(np.dot(view["up"], pose[:3, 1])), -0.80)
+        # +y is world-down in this RDF scene, so a downward-looking view has a
+        # POSITIVE forward.y; that is the pitch magnitude to assert on.
+        pitch = np.degrees(np.arcsin(np.clip(float(view["forward"][1]), -1.0, 1.0)))
+        np.testing.assert_allclose(float(np.dot(view["up"], pose[:3, 1])), -np.cos(np.radians(pitch)), atol=1e-9)
+        self.assertGreater(pitch, 20.0)
+        self.assertLess(pitch, 45.0)
+        self.assertGreater(float(view["forward"][1]), 0.0, "observer must look downward")
+        # The property a viewer would call "the horizon is level": world-down
+        # projects to screen-vertical. Measured on the rendered scene, not on
+        # the basis vectors, because perspective is what can tilt the floor.
+        centre = pose[:3, 3]
+        probe = np.vstack((centre, centre + np.asarray([0.0, 1.0, 0.0])))
+        pixels, _, valid, _ = renderer._project_view(probe, view, (640, 400))
+        self.assertTrue(valid.all())
+        delta = pixels[1] - pixels[0]
+        roll = np.degrees(np.arctan2(delta[0], abs(delta[1])))
+        self.assertLess(abs(roll), 2.0, "camera roll: world-down must stay screen-vertical")
 
     def test_world_pane_keeps_the_video_pane_left_right_order(self):
         import numpy as np
@@ -651,7 +679,9 @@ class DagResultTests(unittest.TestCase):
         left = np.array([[0.05, 0.20, 0.62]] * 21, dtype=float)
         right = np.array([[0.16, 0.13, 0.60]] * 21, dtype=float)
         intrinsic = np.asarray(self.document["Metadata"]["相机内参"], dtype=float)
-        view = renderer._rear_view(pose, [left + pose[:3, 3], right + pose[:3, 3]], 640, 400)
+        cam_verts, _ = renderer._build_cinema_camera(s=0.085)
+        view = renderer._static_follow_view(np.asarray([pose]), np.asarray([True]),
+                                            [left + pose[:3, 3], right + pose[:3, 3]], cam_verts, 640, 400)
         pixels, _, valid, _ = renderer._project_view(
             np.vstack((left + pose[:3, 3], right + pose[:3, 3])), view, (640, 400))
         self.assertTrue(valid.all())
@@ -687,7 +717,10 @@ class DagResultTests(unittest.TestCase):
                 np.testing.assert_allclose(pixels, stored, atol=1e-6)
         # The view must not distort that agreement: the camera-relative lateral
         # ordering of every joint pair survives the world projection.
-        view = renderer._rear_view(pose, [np.asarray(self.document["逐帧轨迹"][0]["帧1"]["手0"]["手部21点坐标"], dtype=float)], 640, 400)
+        cam_verts, _ = renderer._build_cinema_camera(s=0.085)
+        view = renderer._static_follow_view(
+            np.asarray([pose]), np.asarray([True]),
+            [np.asarray(self.document["逐帧轨迹"][0]["帧1"]["手0"]["手部21点坐标"], dtype=float)], cam_verts, 640, 400)
         self.assertAlmostEqual(float(np.linalg.norm(view["forward"])), 1.0, places=9)
 
     def test_spatial_scene_contains_small_camera_rgb_axes_and_full_trail(self):
@@ -756,11 +789,57 @@ class DagResultTests(unittest.TestCase):
         gaps = np.asarray([[0.0, 0.0, 0.0], [np.nan, np.nan, np.nan], [0.002, 0.0, 0.004]], dtype=float)
         np.testing.assert_array_equal(renderer._trajectory_upto(gaps, 2), np.asarray([[0.0, 0.0, 0.0], [0.002, 0.0, 0.004]]))
 
+    def test_observer_view_is_fixed_for_the_whole_clip_with_a_pixel_margin(self):
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        frames = self.document["逐帧轨迹"]
+        poses = np.asarray([frame[list(frame)[0]]["相机世界位姿"] for frame in frames], dtype=float)
+        sides = [[], []]
+        for frame in frames:
+            body = frame[list(frame)[0]]
+            for index, key in enumerate(("手0", "手1")):
+                sides[index].append(np.asarray(body[key]["手部21点坐标"], dtype=float))
+        joints = [np.asarray(side, dtype=float) for side in sides]
+        pose_valid = np.isfinite(poses).all(axis=(1, 2))
+        cam_verts, _ = renderer._build_cinema_camera(s=0.085)
+        width, height = 640, 400
+        view = renderer._static_follow_view(poses, pose_valid, joints, cam_verts, width, height)
+
+        # ONE view object, reused for every frame: nothing re-aims or zooms, so
+        # the eye, basis and focal must be byte-identical across the clip.
+        for frame_index in range(len(frames)):
+            again = renderer._static_follow_view(poses, pose_valid, joints, cam_verts, width, height)
+            np.testing.assert_array_equal(again["eye"], view["eye"])
+            np.testing.assert_array_equal(again["right"], view["right"])
+            self.assertEqual(again["focal"], view["focal"])
+            self.assertEqual(again["cx"], view["cx"])
+            self.assertEqual(again["cy"], view["cy"])
+
+        # Numerical acceptance: the camera body and every hand joint of every
+        # frame land inside the pane with a real margin, and the reported
+        # worst case is the spec's 6% of the pane's short side.
+        worst = None
+        for frame_index in np.flatnonzero(pose_valid):
+            pose = poses[frame_index]
+            body = (pose[:3, :3] @ cam_verts.T).T + pose[:3, 3]
+            chunk = [body]
+            for side in range(2):
+                row = joints[side][frame_index]
+                if np.isfinite(row).all():
+                    chunk.append(row)
+            pixels, _, valid, _ = renderer._project_view(np.vstack(chunk), view, (width, height))
+            self.assertTrue(valid.all(), "scene must sit in front of the fixed eye")
+            margin = min(pixels[:, 0].min(), pixels[:, 1].min(),
+                         (width - 1) - pixels[:, 0].max(), (height - 1) - pixels[:, 1].max())
+            worst = margin if worst is None else min(worst, margin)
+        self.assertGreater(worst, 0.0, "scene must not be clipped at any frame")
+        self.assertGreater(worst, 0.04 * min(width, height), "worst-case margin {:.1f}px".format(worst))
+
     def test_render_labels_are_english(self):
         source = Path(importlib.import_module("ego_anno.rendering.render_ego_json_overlay").__file__).read_text(encoding="utf-8")
         self.assertIn("Hand joints overlay", source)
-        self.assertIn("Camera and hands: side-rear follow view", source)
-        self.assertNotIn("side-rear follow view: camera and hands", source)
+        self.assertIn("Camera and hands: fixed side-rear view", source)
+        self.assertNotIn("fixed side-rear view: camera and hands", source)
         self.assertNotIn("left hand: ", source)
         self.assertNotIn("right hand: ", source)
         self.assertNotIn("手部姿态overlay", source)

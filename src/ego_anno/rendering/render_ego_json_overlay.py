@@ -470,34 +470,6 @@ def _draw_camera_marker(canvas: np.ndarray, pose: np.ndarray, view: dict[str, np
         cv2.arrowedLine(canvas, pa, pb, color, width, cv2.LINE_AA, tipLength=0.28)
 
 
-def _follow_anchor(pose: np.ndarray, centers: np.ndarray, frame_index: int,
-                   frame_joints: list[np.ndarray]) -> np.ndarray:
-    """Smooth camera translation while keeping the current hand cluster centered."""
-    center = np.asarray(pose[:3, 3], dtype=np.float64)
-    end = min(len(centers), frame_index + 1)
-    start = max(0, end - 8)
-    recent = np.asarray(centers[start:end], dtype=np.float64)
-    valid = np.isfinite(recent).all(axis=1)
-    if valid.any():
-        weights = np.exp(np.linspace(-1.4, 0.0, int(valid.sum())))
-        smoothed = np.average(recent[valid], axis=0, weights=weights)
-    else:
-        smoothed = center
-    rotation = np.asarray(pose[:3, :3], dtype=np.float64)
-    right, down = rotation[:, 0], rotation[:, 1]
-    hands = [np.asarray(j, dtype=np.float64) for j in frame_joints
-             if np.asarray(j).shape == (21, 3) and np.isfinite(j).all()]
-    if hands:
-        scene = np.concatenate(hands, axis=0).mean(axis=0)
-        # Do not move along forward: that would put the camera behind the eye.
-        # A modest lateral/vertical correction gives centroid-following without
-        # the spinning/zooming behavior of a free world-space orbit.
-        offset = scene - center
-        smoothed = smoothed + right * (0.22 * float(np.dot(offset, right)))
-        smoothed = smoothed + down * (0.22 * float(np.dot(offset, down)))
-    return smoothed
-
-
 def _trajectory_upto(centers: np.ndarray, frame_index: int) -> np.ndarray:
     """Camera path from the clip start up to and including the current frame.
 
@@ -542,43 +514,122 @@ def _look_at_view(eye: np.ndarray, target: np.ndarray, up_hint: np.ndarray) -> d
     return {"right": right, "up": up, "forward": forward}
 
 
-def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, height: int,
-               extra_points: np.ndarray | None = None,
-               follow_anchor: np.ndarray | None = None) -> dict[str, np.ndarray | float]:
-    rotation = np.asarray(pose[:3, :3], dtype=np.float64)
-    center = np.asarray(pose[:3, 3], dtype=np.float64)
+def _clip_scene_points(poses: np.ndarray, pose_valid: np.ndarray, joints: list[np.ndarray],
+                       cam_verts: np.ndarray) -> np.ndarray:
+    """Every world point the fixed observer must keep in frame, for the whole clip.
+
+    Union of the camera-body hull of each valid pose and all finite hand joints.
+    Computed once so the observer can be placed from the full traverse instead
+    of re-aiming per frame.
+    """
+    chunks: list[np.ndarray] = []
+    for index in np.flatnonzero(pose_valid):
+        pose = np.asarray(poses[index], dtype=np.float64)
+        if not np.isfinite(pose).all():
+            continue
+        chunks.append((pose[:3, :3] @ cam_verts.T).T + pose[:3, 3])
+    for side in range(len(joints)):
+        rows = np.asarray(joints[side], dtype=np.float64).reshape(-1, 21, 3)
+        chunks.append(rows[np.isfinite(rows).all(axis=(1, 2))].reshape(-1, 3))
+    chunks = [chunk for chunk in chunks if len(chunk)]
+    return np.vstack(chunks) if chunks else np.zeros((0, 3), dtype=np.float64)
+
+
+def _frame_extent(points: np.ndarray,
+                  view: dict[str, np.ndarray | float]) -> tuple[float, float, float, float] | None:
+    """Projected bounds of `points` in normalised pinhole coordinates."""
+    if not len(points):
+        return None
+    xyz = _view_coordinates(points, view)
+    valid = np.isfinite(xyz).all(axis=1) & (xyz[:, 2] > 1e-5)
+    if not valid.any():
+        return None
+    nx = xyz[valid, 0] / xyz[valid, 2]
+    ny = xyz[valid, 1] / xyz[valid, 2]
+    return float(nx.min()), float(nx.max()), float(ny.min()), float(ny.max())
+
+
+def _fit_focal(points: np.ndarray, view: dict[str, np.ndarray | float],
+               width: int, height: int, margin: float,
+               cx0: float | None = None, cy0: float | None = None) -> float:
+    """Largest focal length that keeps every point `margin` px inside the pane.
+
+    The extent is centred at (cx0, cy0), which is NOT the pane centre -- the
+    spatial view sits slightly low (cy = 0.54h) so the floor grid reads. An
+    off-centre framing shrinks the usable box on one side, so the fit uses the
+    smaller of the two distances to each pair of edges; assuming a symmetric
+    box here is what let the bottom margin collapse to ~21 px against a 55 px
+    target.
+    """
+    extent = _frame_extent(points, view)
+    if extent is None:
+        return float(min(width, height))
+    x_min, x_max, y_min, y_max = extent
+    cx0 = width * 0.5 if cx0 is None else float(cx0)
+    cy0 = height * 0.54 if cy0 is None else float(cy0)
+    # Half-extent in pixels is focal * range / 2 for each axis, so the binding
+    # constraint per axis is twice the smaller distance to the two edges.
+    budget_x = 2.0 * max(min(cx0 - margin, width - margin - cx0), 1.0)
+    budget_y = 2.0 * max(min(cy0 - margin, height - margin - cy0), 1.0)
+    return float(min(budget_x / max(x_max - x_min, 1e-6), budget_y / max(y_max - y_min, 1e-6)))
+
+
+def _static_follow_view(poses: np.ndarray, pose_valid: np.ndarray, joints: list[np.ndarray],
+                        cam_verts: np.ndarray, width: int, height: int,
+                        margin: float = 0.06) -> dict[str, np.ndarray | float]:
+    """One fixed observer for the entire clip.
+
+    Orientation keeps the reference character -- behind the camera, a little to
+    its side, and now ~33 deg above it -- but the eye, look-at target and framing
+    are solved ONCE from the bounding extent of the camera body and both hands
+    across every frame. Nothing re-aims or zooms between frames, so the prop and
+    the hands keep a constant screen position and apparent size, and the only
+    per-frame change is the trail growing and the camera prop moving along it.
+
+    The camera's orientation at the clip midpoint supplies the basis. A fixed
+    observer needs one orientation for the whole clip; the median pose is the
+    representative choice and keeps a per-frame rotate/translate from turning
+    into an apparent camera roll.
+    """
+    cam_centers = np.asarray(poses[:, :3, 3], dtype=np.float64)
+    valid_centers = cam_centers[np.isfinite(cam_centers).all(axis=1)]
+    if not len(valid_centers):
+        valid_centers = np.zeros((1, 3), dtype=np.float64)
+    anchor = np.median(valid_centers, axis=0)
+
+    valid_indices = np.flatnonzero(pose_valid)
+    midpoint = int(valid_indices[len(valid_indices) // 2]) if len(valid_indices) else 0
+    rotation = np.asarray(poses[midpoint][:3, :3], dtype=np.float64)
+    if not np.isfinite(rotation).all():
+        rotation = np.eye(3, dtype=np.float64)
     right = _normalize(rotation[:, 0], np.asarray([1.0, 0.0, 0.0]))
     down = _normalize(rotation[:, 1], np.asarray([0.0, 1.0, 0.0]))
     forward = _normalize(rotation[:, 2], np.asarray([0.0, 0.0, 1.0]))
-    valid_hands = [np.asarray(j, dtype=np.float64) for j in frame_joints if np.asarray(j).shape == (21, 3) and np.isfinite(j).all()]
-    if valid_hands:
-        merged = np.concatenate(valid_hands, axis=0)
-        hand_depth = (_camera_coordinates(merged, pose))[:, 2]
-        median_depth = float(np.median(hand_depth[hand_depth > 1e-4])) if (hand_depth > 1e-4).any() else 0.5
-    else:
-        merged = np.empty((0, 3), dtype=np.float64)
-        median_depth = 0.5
-    observer_distance = float(np.clip(0.66 * median_depth, 0.26, 0.44))
-    # `observer_distance` was calibrated as a LATERAL offset scale in the old side
-    # view (it was multiplied by 2.4), so using it raw as a standoff drops the eye
-    # inside the camera prop and auto-framing then shrinks the hands behind it.
-    # The 2.6 factor converts it to an eye-to-anchor standoff: ~0.6-1.1 m for
-    # tabletop scenes, which reproduces the reference screenshot's prop scale
-    # (~1/10 of the pane width) with both hands still large and unoccluded.
-    d = float(np.clip(2.6 * observer_distance, 0.62, 1.10))
-    # Three-quarter rear view (reference screenshot): the observer stands BEHIND
-    # the source camera, a little to its side and a little above it, and looks at
-    # the camera plus both hands. `down_cam` is world-down for this RDF pose, so
-    # the up hint is the camera's own -down axis: the horizon stays level and the
-    # frame follows the camera without spinning about the view axis.
-    anchor = center if follow_anchor is None else np.asarray(follow_anchor, dtype=np.float64)
-    # Elevation is atan2(ELEVATION, hypot(0.9, 0.5)) = 33.0 deg above the anchor's
-    # horizontal plane (was 25.9 deg at a 0.5 vertical offset): a small downward
-    # tilt that shows more of the floor grid the trail runs along, while the
-    # look-at target, lateral offset, standoff and up hint stay untouched.
+
+    scene = _clip_scene_points(poses, pose_valid, joints, cam_verts)
+    # The standoff keeps the established band and is driven by the MEDIAN hand
+    # depth over the clip, not by the scene's bounding diagonal. A long traverse
+    # has a large extent because the hands wander metres away from the camera,
+    # and scaling the standoff by that would shove the eye back ~2 m, flattening
+    # the perspective and shrinking the prop and trail to specks. Widening the
+    # framing is the fitted focal's job; the eye stays where the shot reads.
+    depths: list[float] = []
+    for index in np.flatnonzero(pose_valid):
+        merged_rows = [np.asarray(joints[side][index], dtype=np.float64).reshape(-1, 3) for side in range(len(joints))]
+        merged_rows = [row[np.isfinite(row).all(axis=1)] for row in merged_rows]
+        merged_rows = [row for row in merged_rows if len(row)]
+        if not merged_rows:
+            continue
+        hand_depth = _camera_coordinates(np.vstack(merged_rows), np.asarray(poses[index], dtype=np.float64))[:, 2]
+        hand_depth = hand_depth[hand_depth > 1e-4]
+        if len(hand_depth):
+            depths.append(float(np.median(hand_depth)))
+    median_depth = float(np.median(depths)) if depths else 0.5
+    d = float(np.clip(2.6 * float(np.clip(0.66 * median_depth, 0.26, 0.44)), 0.62, 1.10))
     eye = anchor - forward * (0.9 * d) - right * (0.5 * d) - down * (_EYE_ELEVATION * d)
-    target = np.asarray(merged, dtype=np.float64).mean(axis=0) if len(merged) else (anchor + forward * d)
+    target = np.asarray(scene, dtype=np.float64).mean(axis=0) if len(scene) else (anchor + forward * d)
     basis = _look_at_view(eye, target, -down)
+
     view: dict[str, np.ndarray | float] = {
         "eye": eye,
         "right": basis["right"],
@@ -588,26 +639,17 @@ def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, hei
         "cx": width * 0.5,
         "cy": height * 0.54,
     }
-    marker, _ = _camera_marker_points(pose)
-    required = np.vstack((marker, merged)) if len(merged) else marker
-    if extra_points is not None and np.asarray(extra_points).size:
-        required = np.vstack((required, np.asarray(extra_points, dtype=np.float64).reshape(-1, 3)))
-    xyz = _view_coordinates(required, view)
-    valid = np.isfinite(xyz).all(axis=1) & (xyz[:, 2] > 1e-5)
-    if valid.any():
-        nx = xyz[valid, 0] / xyz[valid, 2]
-        ny = xyz[valid, 1] / xyz[valid, 2]
-        x_min, x_max = float(nx.min()), float(nx.max())
-        y_min, y_max = float(ny.min()), float(ny.max())
-        range_x = max(x_max - x_min, 1e-4)
-        range_y = max(y_max - y_min, 1e-4)
-        focal = min(0.85 * width / range_x, 0.85 * height / range_y, 1.8 * min(width, height))
-        focal = max(0.45 * min(width, height), focal)
-        mean_x = 0.5 * (x_min + x_max)
-        mean_y = 0.5 * (y_min + y_max)
-        view["focal"] = float(focal)
-        view["cx"] = float(width * 0.5 - focal * mean_x)
-        view["cy"] = float(height * 0.54 + focal * mean_y)
+    # Fit the whole clip, then centre on the fitted extent so the margin is
+    # symmetric instead of clipping whichever end of the traverse projected
+    # furthest from centre.
+    px_margin = margin * min(width, height)
+    view["focal"] = _fit_focal(scene, view, width, height, px_margin, width * 0.5, height * 0.54)
+    extent = _frame_extent(scene, view)
+    if extent is not None:
+        x_min, x_max, y_min, y_max = extent
+        focal = float(view["focal"])
+        view["cx"] = float(width * 0.5 - focal * 0.5 * (x_min + x_max))
+        view["cy"] = float(height * 0.54 + focal * 0.5 * (y_min + y_max))
     return view
 
 
@@ -906,16 +948,20 @@ def _render_source_hand(source: np.ndarray, side: int, joints_world: np.ndarray,
 def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, frame_index: int,
                   frame_joints: list[np.ndarray], meshes: list[np.ndarray | None], assets: HandSurfaceAssets | None,
                   frame_betas: list[np.ndarray] | None = None, intrinsic: np.ndarray | None = None,
-                  source_size: tuple[int, int] | None = None) -> np.ndarray:
+                  source_size: tuple[int, int] | None = None,
+                  view: dict[str, np.ndarray | float] | None = None) -> np.ndarray:
     width, height = size
     canvas = _spatial_background(width, height)
     # Keep the reference cinema-camera proportions, but make the object small
     # enough to read as a spatial-view anchor rather than a dominant prop.
     cam_verts, cam_faces = _build_cinema_camera(s=0.085)
     cam_world = (np.asarray(pose[:3, :3], dtype=np.float64) @ cam_verts.T).T + pose[:3, 3]
-    # Frame the camera body and hands with the stable side-rear follow view.
-    follow_anchor = _follow_anchor(pose, centers, frame_index, frame_joints)
-    view = _rear_view(pose, frame_joints, width, height, cam_world, follow_anchor)
+    if view is None:
+        # Single-frame callers (tests, stills) solve the static view from this
+        # one pose; the render loop passes the clip-wide view instead so nothing
+        # re-aims between frames.
+        view = _static_follow_view(np.asarray(pose, dtype=np.float64)[None], np.asarray([True]),
+                                   frame_joints, cam_verts, width, height)
     _draw_camera_grid(canvas, pose, frame_joints, view)
 
     skin_color = SKIN_COLOR
@@ -1039,6 +1085,11 @@ def main() -> int:
         raise SystemExit(f"cannot open writer: {args.output}")
 
     centers = np.where(pose_valid[:, None], poses[:, :3, 3], np.nan)
+    # One fixed observer for the whole clip: solved from every valid camera pose
+    # and every hand joint in the annotation, so the pane never re-aims, zooms or
+    # drifts between frames. Computed outside the loop on purpose.
+    world_cam_verts, _ = _build_cinema_camera(s=0.085)
+    static_view = _static_follow_view(poses, pose_valid, joints, world_cam_verts, pane_width, pane_height)
     cursor = 0
     while cursor < len(subtitles) and int(subtitles[cursor]["起始帧"][1]) < start + 1:
         cursor += 1
@@ -1065,7 +1116,7 @@ def main() -> int:
             if pose_valid[frame_index]:
                 world = _render_world((pane_width, pane_height), poses[frame_index], centers, frame_index, frame_joints, meshes, assets,
                                       [betas[0][frame_index], betas[1][frame_index]], intrinsic,
-                                      (source_width, source_height))
+                                      (source_width, source_height), view=static_view)
                 for side, side_name in ((0, "left"), (1, "right")):
                     if meshes[side] is not None:
                         world_mesh_faces += len(assets.faces(side_name))
@@ -1081,7 +1132,7 @@ def main() -> int:
             canvas[:pane_height, pane_width:pane_width * 2] = world
             title_size = max(30, int(round(pane_height * 0.043)))
             left_title = "Hand joints overlay"
-            right_title = "Camera and hands: side-rear follow view"
+            right_title = "Camera and hands: fixed side-rear view"
             _put_text_mixed(canvas, left_title, (24, 64), title_size, (255, 255, 255), 2)
             _put_text_mixed(canvas, right_title, (pane_width + 24, 64), title_size, (255, 255, 255), 2)
             _draw_subtitle(canvas, structured, narrative, frame_index, frame_count, band_height)
