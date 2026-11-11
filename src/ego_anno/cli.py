@@ -38,7 +38,7 @@ def main(argv=None):
         sub.add_argument("--calibration")
         sub.add_argument("--method", choices=("baseline", "stereo_sj", "stereo_sjcf"))
         sub.add_argument("--pipeline", choices=("dag", "e2e"), default="dag",
-                         help="dag (default) or e2e (Cosmos3 hand147; needs ffmpeg)")
+                         help="dag (default) or e2e (Cosmos3 hand+head; needs ffmpeg)")
         sub.add_argument("--prompt", help="e2e only: task description, at most 1000 characters")
         sub.add_argument("--camera", help="e2e only: camera.json with source_size_wh and source_K")
         sub.add_argument("--save-inputs", metavar="DIR",

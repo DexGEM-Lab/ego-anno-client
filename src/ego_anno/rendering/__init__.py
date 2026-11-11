@@ -28,7 +28,9 @@ __all__ = ["render_result", "render_video_result"]
 
 DAG_SCHEMA = "ego.annotation.product_json.v3"
 COSMOS_SCHEMA = "cosmos-e2e-result/v1"
-SUPPORTED_SCHEMAS = (COSMOS_SCHEMA, DAG_SCHEMA)
+COSMOS_HEAD_SCHEMA = "cosmos-e2e-result/v2"
+COSMOS_SCHEMAS = (COSMOS_SCHEMA, COSMOS_HEAD_SCHEMA)
+SUPPORTED_SCHEMAS = COSMOS_SCHEMAS + (DAG_SCHEMA,)
 
 # The DAG writes one 手0/手1 entry per frame; MANO shape parameters live here.
 HAND_KEYS = ("手0", "手1")
@@ -173,9 +175,9 @@ def render_result(result, inputs, output, width=None, height=None):
         protected = [result_path, video_path.resolve(), camera_path.resolve(), submission_path.resolve()]
         _refuse_collision(destination, protected)
         document = _read_object(result_path, "result")
-        if document.get("schema") != "cosmos-e2e-result/v1":
-            raise ClientError("offline rendering of a saved bundle only accepts cosmos-e2e-result/v1; "
-                              "render a DAG result with --video FILE")
+        if document.get("schema") not in COSMOS_SCHEMAS:
+            raise ClientError("offline rendering of a saved bundle only accepts {}; ".format(
+                " or ".join(COSMOS_SCHEMAS)) + "render a DAG result with --video FILE")
         submission = _read_object(submission_path, "submission metadata")
         camera = _read_object(camera_path, "calibration") if camera_path.exists() else None
         expected_size = _validate_submission(submission, document, camera)
@@ -318,7 +320,8 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
     """Render a downloaded result against the exact video the job consumed.
 
     Supported results are the DAG ``ego.annotation.product_json.v3`` document
-    and the Cosmos ``cosmos-e2e-result/v1`` document, both as served by
+    and the Cosmos ``cosmos-e2e-result/v1``/``cosmos-e2e-result/v2`` documents,
+    both as served by
     ``GET /api/v1/annotation-jobs/{id}/result``. ``video`` must be the file the
     job was submitted with; nothing is resampled or calibrated implicitly.
 
@@ -351,7 +354,7 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
         count = None
         if schema == DAG_SCHEMA:
             if camera_path is not None:
-                raise ClientError("--camera applies to cosmos-e2e-result/v1; DAG results "
+                raise ClientError("--camera applies to Cosmos e2e results; DAG results "
                                   "carry their own 相机内参")
             count = _validate_dag_document(document)
         cv2 = _load_video_dependency()
@@ -380,7 +383,7 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
             temporary = tempfile.TemporaryDirectory(prefix="ego-anno-render-input-")
             prepared = Path(temporary.name) / "annotation.json"
             _write_document(prepared, _without_mano_shapes(document))
-        _encode_renderer_output(prepared, video_path, camera_path if schema == COSMOS_SCHEMA else None,
+        _encode_renderer_output(prepared, video_path, camera_path if schema in COSMOS_SCHEMAS else None,
                                 destination, output_size[0], output_size[1], extra)
         return destination
     except ClientError:

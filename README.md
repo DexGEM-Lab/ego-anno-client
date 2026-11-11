@@ -16,13 +16,13 @@ and API key at **https://anno.dex-gem.ai** (API keys page); the account needs
 annotation credits. Never put a key in chat, logs, source code, or a Git commit.
 If you have no key/video, obtain them from the user rather than inventing them.
 
-Use a mono clip with 15–30 fps, duration at most 20 s, and short side
-640–1440 px. A clip of roughly 2–16 seconds is convenient for a first test.
+Use a mono clip with 15–30 fps, 2 s to 10 minutes long, and short side
+640–1440 px. A clip of roughly 2–60 seconds is convenient for a first test.
 From a fresh directory, run:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install "ego-anno-client[render] @ https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.4.1/ego_anno_client-0.4.1-py3-none-any.whl"
+.venv/bin/python -m pip install "ego-anno-client[render] @ https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.5.0/ego_anno_client-0.5.0-py3-none-any.whl"
 
 # Set EGO_ANNO_API_KEY privately in the environment before running the client.
 .venv/bin/ego-anno submit --pipeline e2e --video ./clip.mp4 \
@@ -41,8 +41,10 @@ shows the source video and predicted 3D skeleton/trajectory, but does **not**
 invent a source-video projection. Without beta, no MANO mesh is rendered.
 
 Success means: the job is `succeeded`, downloaded JSON has schema
-`cosmos-e2e-result/v1` with `num_frames - 1` rows of 147 finite values, and
-`preview.mp4` decodes as H.264 at 15 fps with `num_frames` frames.
+`cosmos-e2e-result/v2` with `num_frames - 1` rows of 156 finite action values,
+an explicit `c2w` head trajectory of `num_frames` proper SE(3) matrices whose
+first frame is the identity, and `preview.mp4` decodes as H.264 at 15 fps
+with `num_frames` frames.
 
 The default `dag` pipeline renders from the video you submitted instead of a
 saved bundle:
@@ -62,13 +64,13 @@ Two pipelines share the same account, API key, and credit balance:
 
 | | `dag` (default) | `e2e` |
 | --- | --- | --- |
-| Model | ego-anno annotation DAG | Cosmos3 hand147 end-to-end model |
+| Model | ego-anno annotation DAG | Cosmos3 hand+head end-to-end model |
 | Input | Mono video, or stereo videos + calibration | Mono video only |
-| Video limits | Up to 1800 frames per view at native fps and resolution | 15–30 fps, at most 20 s, short side 640–1440 px |
-| Local processing | None; the file is uploaded as-is | Resampled to 15 fps, first 17–241 frames kept, short side above 1080 px scaled to 1080 |
+| Video limits | Up to 1800 frames per view at native fps and resolution | 15–30 fps, 31–9001 frames at 15 fps (about 2 s to 10 minutes), short side 640–1440 px |
+| Local processing | None; the file is uploaded as-is | Resampled to 15 fps, every frame kept (31–9001; longer is rejected, never trimmed), short side above 1080 px scaled to 1080 |
 | Extra inputs | `--method` (stereo only) | Optional `--prompt` and `--camera` intrinsics |
 | Billing | Whole seconds of video duration | `max(1, ceil(duration × 0.1))` seconds of the uploaded 15 fps clip |
-| Result | `ego.annotation.product_json.v3` annotation JSON | `cosmos-e2e-result/v1` JSON with 15 Hz camera motion and 147-D hand actions |
+| Result | `ego.annotation.product_json.v3` annotation JSON | `cosmos-e2e-result/v2` JSON with 15 Hz head camera-to-world poses, 156-D actions, and camera-frame hand joints |
 | Local render | `ego-anno render --video <the submitted video>` | `ego-anno render --inputs <saved inputs>` |
 | Needs | Python only | Python plus FFmpeg (`ffmpeg` and `ffprobe` on PATH) |
 
@@ -77,23 +79,24 @@ The e2e billing ratio (default 0.1) is a deployment setting.
 ## 1. Download and install the client
 
 Install Python 3.8+ with pip, preferably in a virtual environment. Get the
-released client from the public [v0.4.1 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.4.1).
+released client from the public [v0.5.0 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.5.0).
 Install its wheel directly (no Git checkout required):
 
 ```bash
-python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.4.1/ego_anno_client-0.4.1-py3-none-any.whl"
+python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.5.0/ego_anno_client-0.5.0-py3-none-any.whl"
 ego-anno --help
 ```
 
-Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.4.1/ego_anno_client-0.4.1-py3-none-any.whl)
+Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.5.0/ego_anno_client-0.5.0-py3-none-any.whl)
 from that Release and install the local file:
 
 ```bash
-python3 -m pip install ./ego_anno_client-0.4.1-py3-none-any.whl
+python3 -m pip install ./ego_anno_client-0.5.0-py3-none-any.whl
 ```
 
-The v0.4.1 wheel includes the existing optional local renderers and the e2e
-FFmpeg 9 compatibility fix. Use the `[render]` extra only when rendering locally.
+The v0.5.0 wheel admits 31–9001 frame e2e clips and renders the hand+head
+`cosmos-e2e-result/v2` schema while keeping every v0.4.1 capability (including
+v1 downloads and renders). Use the `[render]` extra only when rendering locally.
 
 
 If `ego-anno` is not on your PATH, use `python3 -m ego_anno` in its place.
@@ -135,7 +138,7 @@ chooses the default. Do not combine `--video` with stereo options.
 
 ### e2e pipeline
 
-Submit a monocular video to the Cosmos3 hand147 model with `--pipeline e2e`:
+Submit a monocular video to the Cosmos3 hand+head model with `--pipeline e2e`:
 
 ```bash
 ego-anno submit --video ./video.mp4 --pipeline e2e
@@ -159,14 +162,14 @@ and positive focal lengths. e2e cannot be combined with stereo options or
 Before uploading, the client checks and converts the video in a temporary
 directory with FFmpeg:
 
-- Frame rate above 30 fps or below 15 fps, duration above 20 s, or a short
-  side below 640 px or above 1440 px is rejected with an error.
+- Frame rate above 30 fps or below 15 fps, or a short side below 640 px or
+  above 1440 px, is rejected with an error.
 - The video is resampled by timestamp to exactly 15 fps (each output frame is
-  the source frame nearest to its 1/15 s slot), the first
-  min(241, available) frames are kept, and the count is trimmed to the
-  largest N with (N - 1) divisible by 4. Fewer than 17 frames (about 1.07 s)
-  is rejected. A clip with 240 sampled frames is trimmed to 237; a clip with
-  at least 241 sampled frames keeps 241 (spanning 16.0 s); a 10 s clip uses 149.
+  the source frame nearest to its 1/15 s slot) and every resampled frame is
+  kept. Fewer than 31 frames (about 2 s) or more than 9001 frames (10 minutes)
+  is rejected as a whole — the video is never trimmed to fit. The frame count
+  comes from decoded frame timestamps, so broken container metadata (a wrong
+  header frame count or duration) cannot shorten or lengthen a submission.
 - A short side above 1080 px is scaled down to 1080 px, keeping the aspect
   ratio with even dimensions (2560x1440 becomes 1920x1080). An odd width or
   height at or below 1080 px loses its last pixel column or row. Rotation
@@ -177,8 +180,8 @@ directory with FFmpeg:
   `+faststart`. It is re-probed and must contain exactly N frames at 15 fps
   at the expected size before upload.
 
-The server enforces the converted form (15 fps, 17–241 frames with (N - 1)
-divisible by 4, short side 640–1080, long side at most 2560) and answers
+The server enforces the converted form (15 fps CFR, 31–9001 frames, short
+side 640–1080, long side at most 2560) and answers
 `422 invalid_e2e_input`, `invalid_camera`, or `invalid_pipeline` otherwise;
 `503 annotation_e2e_disabled` means the deployment has e2e switched off.
 
@@ -228,12 +231,17 @@ ego-anno download "$JOB_ID" -o annotation.json
 The file is written to a temporary file and atomically moved into place after
 the complete response arrives, replacing an existing destination.
 
-e2e jobs download a `cosmos-e2e-result/v1` JSON document with `fps` 15,
-`num_frames` N, and `action`: N - 1 rows of 147 physical values (row k is the
-camera motion from frame k to k + 1 and both hands at frame k + 1), plus
-`channel_layout`, `frame_alignment`, `model`, and `receipt` describing the
-inference. The server returns JSON only; use the offline render command below
-to produce an MP4.
+e2e jobs download a `cosmos-e2e-result/v2` JSON document with `fps` 15,
+`num_frames` N, `action`: N - 1 rows of 156 physical values (row k describes
+frame k + 1; the [147,156) head anchor is relative to the first frame of the
+model window owning the row and must never be integrated across windows),
+`joints_camera`: N - 1 right-then-left 21-joint hands in the camera frame of
+frame k + 1, and the explicit head trajectory `c2w`: N camera-to-world SE(3)
+matrices in metres with frame 0 the identity (bundle-adjusted where the
+service selected it, otherwise the model trajectory; `windows`, `frame_window`
+and `ba` record the per-window provenance). Older `cosmos-e2e-result/v1`
+results remain downloadable and renderable. The server returns JSON only; use
+the offline render command below to produce an MP4.
 
 ## 6. Render results offline
 
@@ -407,4 +415,5 @@ E2e preprocessing supports FFmpeg 4.4 and newer, including builds that removed
 `-vsync`. The client detects `-fps_mode` support from the installed binary and
 uses it when available, otherwise uses legacy `-vsync`. Exact timestamp-selected
 source frames are preserved with a balanced selection expression, avoiding the
-parser-depth failure for 121/241-frame clips. No frame sampling rule changes.
+parser-depth failure for long clips (verified to 9001 frames). No frame
+sampling rule changes.

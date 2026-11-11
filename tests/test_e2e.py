@@ -41,10 +41,12 @@ class SourceRuleTests(unittest.TestCase):
         self.rejected("15 to 30 fps", fps=30.01)
         self.rejected("frame rate", fps=None)
 
-    def test_duration_boundaries(self):
-        self.ok(duration=20.0)
-        self.rejected("at most 20 s", duration=20.01)
-        self.rejected("duration", duration=None)
+    def test_duration_metadata_is_not_an_admission_limit(self):
+        # The 31..9001 decoded frame count alone governs length: a 9001-frame
+        # video reports a container duration of about 600.07 s, and a broken
+        # container may report a nonsense duration for a decodable video.
+        for duration in (600.07, 3600.0, 0.05, None, float("nan")):
+            self.ok(duration=duration)
 
     def test_short_side_boundaries(self):
         for width, height in ((639, 1280), (1280, 639), (1441, 2560), (2560, 1441)):
@@ -52,15 +54,15 @@ class SourceRuleTests(unittest.TestCase):
         for width, height in ((640, 1280), (1280, 640), (1440, 2560), (2560, 1440)):
             self.ok(width=width, height=height)
 
-    def test_frame_count_trimming(self):
-        self.assertEqual(e2e.frame_count(241), 241)
-        self.assertEqual(e2e.frame_count(240), 237)
-        self.assertEqual(e2e.frame_count(300), 241)
-        self.assertEqual(e2e.frame_count(150), 149)
-        self.assertEqual(e2e.frame_count(20), 17)
-        self.assertEqual(e2e.frame_count(17), 17)
-        for available in (16, 1, 0):
-            with self.assertRaisesRegex(ego_anno.ClientError, "at least 17 frames"):
+    def test_frame_count_limits(self):
+        # Every slot is kept: no 241 cap and no (N - 1) % 4 trimming.
+        for count in (31, 32, 61, 121, 241, 242, 243, 9000, 9001):
+            self.assertEqual(e2e.frame_count(count), count)
+        for available in (30, 17, 16, 1, 0):
+            with self.assertRaisesRegex(ego_anno.ClientError, "at least 31 frames"):
+                e2e.frame_count(available)
+        for available in (9002, 10000):
+            with self.assertRaisesRegex(ego_anno.ClientError, "at most 9001 frames"):
                 e2e.frame_count(available)
 
     def test_slot_count_uses_timestamps(self):
@@ -279,14 +281,16 @@ class FfmpegCompatibilityTests(unittest.TestCase):
 
     def test_balanced_selection_preserves_every_member_and_bounds_depth(self):
         import re
-        expression = e2e.video_filter(list(range(241)),640,640,e2e.Geometry(640,640,False)).split(",")[0]
-        self.assertEqual([int(x) for x in re.findall(r"not\(n-(\d+)\)", expression)], list(range(241)))
-        depth = maximum = 0
-        for char in expression:
-            if char == "(": depth += 1; maximum = max(maximum, depth)
-            elif char == ")": depth -= 1
-        self.assertEqual(depth, 0)
-        self.assertLessEqual(maximum, 9)
+        for count in (241, 9001):
+            expression = e2e.video_filter(list(range(count)), 640, 640,
+                                          e2e.Geometry(640, 640, False)).split(",")[0]
+            self.assertEqual([int(x) for x in re.findall(r"not\(n-(\d+)\)", expression)], list(range(count)))
+            depth = maximum = 0
+            for char in expression:
+                if char == "(": depth += 1; maximum = max(maximum, depth)
+                elif char == ")": depth -= 1
+            self.assertEqual(depth, 0)
+            self.assertLessEqual(maximum, 15)
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg/ffprobe not installed")
@@ -310,17 +314,17 @@ class FfmpegTests(unittest.TestCase):
 
     def test_resample_and_verify(self):
         # 4:4:4 allows odd dimensions; the output drops the last column/row.
-        video = self.make("clip.mp4", 24, 2, "853x641", ["-pix_fmt", "yuv444p"])
+        video = self.make("clip.mp4", 24, 2.5, "853x641", ["-pix_fmt", "yuv444p"])
         prepared = e2e.preprocess(video, self.out)
-        self.assertEqual(prepared[1:], (29, 852, 640, None))
+        self.assertEqual(prepared[1:], (38, 852, 640, None))
         probe = e2e._probe_json("ffprobe", ["-count_frames", "-show_streams", prepared.path])["streams"]
         self.assertEqual([(s["codec_type"], s["pix_fmt"], s["avg_frame_rate"], s["nb_read_frames"]) for s in probe],
-                         [("video", "yuv420p", "15/1", "29")])
+                         [("video", "yuv420p", "15/1", "38")])
         with self.assertRaisesRegex(ego_anno.ClientError, "refusing to overwrite"):
             e2e.preprocess(video, self.out)
 
     def test_rotation_uses_displayed_size(self):
-        coded = self.make("coded.mp4", 30, 1.2, "1280x720")
+        coded = self.make("coded.mp4", 30, 2.2, "1280x720")
         video = os.path.join(self.directory, "rotated.mp4")
         help_text = subprocess.check_output(["ffmpeg", "-hide_banner", "-h", "full"])
         # Modern FFmpeg no longer converts a rotate metadata tag into the
@@ -335,20 +339,35 @@ class FfmpegTests(unittest.TestCase):
         camera = e2e.load_camera({"source_size_wh": [720, 1280],
                                   "source_K": [[900, 0, 359.5], [0, 900, 639.5], [0, 0, 1]]})
         prepared = e2e.preprocess(video, self.out, camera)
-        self.assertEqual((prepared.num_frames, prepared.width, prepared.height), (17, 720, 1280))
+        self.assertEqual((prepared.num_frames, prepared.width, prepared.height), (33, 720, 1280))
         self.assertEqual(prepared.camera["source_size_wh"], [720, 1280])
         stream = e2e._probe_json("ffprobe", ["-show_streams", prepared.path])["streams"][0]
         self.assertEqual((stream["width"], stream["height"]), (720, 1280))
         self.assertFalse(stream.get("side_data_list"))
 
     def test_legal_long_clips_preserve_frame_count(self):
-        for count in (121, 241):
+        # 31 was previously trimmed to 29; 242 was previously clipped to 241.
+        for count in (31, 61, 121, 241, 242):
             with self.subTest(frames=count):
                 video = self.make("long-{}.mp4".format(count), 15, count / 15, "640x640")
                 out = os.path.join(self.directory, "long-out-{}".format(count))
                 os.mkdir(out)
                 prepared = e2e.preprocess(video, out)
                 self.assertEqual((prepared.num_frames, prepared.width, prepared.height), (count, 640, 640))
+
+    def test_generated_minute_long_clip_is_fully_kept(self):
+        # Generated fixture (not a user recording): 41.3 s must no longer hit a 20 s cap.
+        video = self.make("forty.mp4", 15, 620 / 15, "640x640")
+        prepared = e2e.preprocess(video, self.out)
+        self.assertEqual(prepared.num_frames, 620)
+
+    def test_generated_business_max_overflow_is_rejected_not_trimmed(self):
+        # 9002 frames at 15 fps exceeds the 10-minute business maximum; the
+        # whole video is rejected after probing, never trimmed back to 9001.
+        video = self.make("edge.mp4", 15, 9002 / 15, "640x640")
+        with self.assertRaisesRegex(ego_anno.ClientError, "at most 9001 frames"):
+            e2e.preprocess(video, self.out)
+        self.assertEqual(os.listdir(self.out), [])
 
     def test_rejects_low_fps(self):
         video = self.make("slow.mp4", 10, 2, "854x640")
