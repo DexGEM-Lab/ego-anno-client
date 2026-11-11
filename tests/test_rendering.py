@@ -1,6 +1,7 @@
 """Public offline rendering tests; optional real-media cases use no model assets."""
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -37,6 +38,39 @@ def physical_result(count=3):
             "frame_alignment": {"destination_timestamps_seconds": [i / 15 for i in range(1, count)]}}
 
 
+def physical_result_v2(count=3):
+    """Finite cosmos-e2e-result/v2 with explicit c2w and right-first camera joints."""
+    rows = []
+    for frame in range(count - 1):
+        row = [0.0] * 156
+        row[3:9] = [1, 0, 0, 0, 1, 0]
+        # The head anchor is window-first-frame-relative; the converter must
+        # never integrate it. Large finite values make any integration visible.
+        row[147:156] = [100.0, 200.0, 300.0, 1, 0, 0, 0, 1, 0]
+        rows.append(row)
+    joints = []
+    for frame in range(count - 1):
+        hands = []
+        for side in range(2):  # the v2 layout serializes the right hand first
+            base = 0.05 if side == 0 else -0.05
+            hands.append([[base + 0.001 * joint, -0.002 * joint, 0.5 + 0.001 * joint]
+                          for joint in range(21)])
+        joints.append(hands)
+    poses = []
+    for frame in range(count):
+        poses.append([[1.0, 0.0, 0.0, 0.01 * frame], [0.0, 1.0, 0.0, 0.0],
+                      [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+    return {"schema": "cosmos-e2e-result/v2", "num_frames": count,
+            "num_actions": count - 1, "action_dim": 156, "fps": 15, "action": rows,
+            "joints_camera": joints,
+            "joints_layout": {"side_order": ["right", "left"],
+                              "joint_convention": "wrist0-thumb1_4-index5_8-middle9_12-ring13_16-little17_20",
+                              "coordinate_frame": "camera_absolute",
+                              "row_k": "joints in the camera frame of video frame k+1"},
+            "c2w": poses,
+            "frame_alignment": {"destination_timestamps_seconds": [i / 15 for i in range(1, count)]}}
+
+
 class BundleCase(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -70,11 +104,11 @@ class BundleCase(unittest.TestCase):
 
 
 class RenderValidationTests(BundleCase):
-    def test_only_cosmos_schema_is_accepted(self):
-        for result in ({"schema": "ego.annotation.product_json.v3"}, {}, {"schema": "cosmos-e2e-result/v2"}):
+    def test_only_cosmos_schemas_are_accepted(self):
+        for result in ({"schema": "ego.annotation.product_json.v3"}, {}, {"schema": "cosmos-e2e-result/v3"}):
             with self.subTest(result=result):
                 self.save_json(self.result_path, result)
-                self.rejected("only accepts cosmos-e2e-result/v1")
+                self.rejected("only accepts cosmos-e2e-result/v1 or cosmos-e2e-result/v2")
 
     def test_submission_schema_and_pipeline_are_required(self):
         for field, value in (("schema", "other/v1"), ("pipeline", "dag")):
@@ -264,6 +298,13 @@ class RealOfflineRenderTests(BundleCase):
         self.assertIsNone(document["Metadata"]["相机内参"])
         self.assertIsNone(document["逐帧轨迹"][1]["帧2"]["手0"]["beta参数"])
 
+    def test_real_render_v2_bundle_uses_the_explicit_trajectory(self):
+        self.save_json(self.result_path, physical_result_v2())
+        destination = self.render()
+        self.assertEqual(destination, self.output)
+        stream = self.probe_output()
+        self.assertEqual([stream["width"], stream["height"]], [320, 240])
+
     def test_real_render_with_processed_calibration_and_layout_override(self):
         camera = {"source_size_wh": [320, 240], "source_K": [[240, 0, 159.5], [0, 240, 119.5], [0, 0, 1]]}
         self.save_json(self.inputs / "camera.json", camera)
@@ -294,6 +335,12 @@ class RealOfflineRenderTests(BundleCase):
         self.result["action"][0][3:9] = [0] * 6
         self.save_json(self.result_path, self.result)
         self.rejected("rot6d columns")
+
+    def test_invalid_v2_c2w_is_reported_without_traceback(self):
+        result = physical_result_v2()
+        result["c2w"][0][0][0] = 2.0  # frame 0 of the final trajectory must be the identity
+        self.save_json(self.result_path, result)
+        self.rejected("identity")
 
     def test_transcode_failure_preserves_destination_and_cleans_temporary_files(self):
         real_run = rendering._run
@@ -344,6 +391,87 @@ def dag_document(count=3, width=640, height=480):
 HAND_COLORS = ((76, 220, 92), (42, 205, 255))
 
 
+@unittest.skipUnless(importlib.util.find_spec("numpy") is not None, "numpy (render extra) not installed")
+class CosmosHeadDocumentTests(unittest.TestCase):
+    """Unit tests for the cosmos-e2e-result/v2 converter (no ffmpeg needed)."""
+
+    def setUp(self):
+        import numpy as np
+        self.np = np
+        from ego_anno.rendering.cosmos_e2e import CosmosE2EHeadDocument
+        self.converter = CosmosE2EHeadDocument
+
+    def test_explicit_c2w_and_right_first_layout(self):
+        result = physical_result_v2(3)
+        document = self.converter.convert(result)
+        self.assertEqual(document["Metadata"]["source_schema"], "cosmos-e2e-result/v2")
+        self.assertEqual(document["Metadata"]["帧数"], 3)
+        frames = document["逐帧轨迹"]
+        for index, frame in enumerate(frames):
+            body = frame["帧{}".format(index + 1)]
+            self.assertEqual(body["相机世界位姿"], result["c2w"][index])
+        self.assertIsNone(frames[0]["帧1"]["手0"])
+        self.assertFalse(frames[0]["帧1"]["左手是否存在"])
+        # Renderer hand0 is left; the v2 layout serializes the right hand first.
+        left = self.np.array(result["joints_camera"][0][1])
+        right = self.np.array(result["joints_camera"][0][0])
+        hand = frames[1]["帧2"]["手0"]
+        self.assertEqual(hand["左或右"], "left")
+        # World joints are the camera-frame joints transformed by c2w[frame].
+        self.assertTrue(self.np.allclose(self.np.array(hand["手部21点坐标"]), left + [0.01, 0, 0]))
+        self.assertTrue(self.np.allclose(self.np.array(frames[1]["帧2"]["手1"]["手部21点坐标"]),
+                                         right + [0.01, 0, 0]))
+
+    def test_action_camera_and_anchor_channels_are_never_integrated(self):
+        result = physical_result_v2(4)
+        for row in result["action"]:
+            row[0:3] = [5.0, 6.0, 7.0]  # camera delta; v1 would integrate this
+            row[147:156] = [1000.0, 0.0, 0.0, 1, 0, 0, 0, 1, 0]
+        document = self.converter.convert(result)
+        for index, frame in enumerate(document["逐帧轨迹"]):
+            self.assertEqual(frame["帧{}".format(index + 1)]["相机世界位姿"], result["c2w"][index])
+
+    def test_projection_uses_camera_frame_joints(self):
+        camera = {"source_size_wh": [320, 240],
+                  "source_K": [[240, 0, 159.5], [0, 240, 119.5], [0, 0, 1]]}
+        result = physical_result_v2(2)
+        document = self.converter.convert(result, camera)
+        hand = document["逐帧轨迹"][1]["帧2"]["手0"]
+        joint = result["joints_camera"][0][1][0]  # left wrist, camera frame of frame 2
+        expected = [240 * joint[0] / joint[2] + 159.5, 240 * joint[1] / joint[2] + 119.5]
+        self.assertTrue(self.np.allclose(hand["手部21点投影坐标"][0], expected))
+        self.assertEqual(document["Metadata"]["相机内参"], camera["source_K"])
+        without = self.converter.convert(physical_result_v2(2))
+        self.assertIsNone(without["逐帧轨迹"][1]["帧2"]["手0"]["手部21点投影坐标"])
+        self.assertIsNone(without["Metadata"]["相机内参"])
+
+    def test_malformed_v2_results_are_rejected(self):
+        cases = []
+        bad = physical_result_v2(); bad["schema"] = "cosmos-e2e-result/v1"
+        cases.append((bad, "expected cosmos-e2e-result/v2"))
+        bad = physical_result_v2(); bad["action"] = [row[:147] for row in bad["action"]]
+        cases.append((bad, r"physical \[N-1,156\]"))
+        bad = physical_result_v2(); bad["num_actions"] = 5
+        cases.append((bad, "num_actions/action_dim"))
+        bad = physical_result_v2(); bad["action_dim"] = 147
+        cases.append((bad, "num_actions/action_dim"))
+        bad = physical_result_v2(); bad["joints_layout"]["side_order"] = ["left", "right"]
+        cases.append((bad, "side_order"))
+        bad = physical_result_v2(); bad["joints_camera"][0][0][0][0] = float("nan")
+        cases.append((bad, "joints_camera"))
+        bad = physical_result_v2(); bad["c2w"][0][0][3] = 0.5
+        cases.append((bad, "identity"))
+        bad = physical_result_v2(); bad["c2w"][1][3] = [0, 0, 0, 2]
+        cases.append((bad, "homogeneous"))
+        bad = physical_result_v2(); bad["c2w"][1][0][0] = 2.0
+        cases.append((bad, "proper"))
+        bad = physical_result_v2(); bad["fps"] = 30
+        cases.append((bad, "destination timestamps"))
+        for result, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self.converter.convert(result)
+
+
 class DagResultTests(unittest.TestCase):
     """Document handling for the default (DAG) pipeline result."""
 
@@ -372,12 +500,12 @@ class DagResultTests(unittest.TestCase):
                          "cosmos-e2e-result/v1")
         self.assertIsNone(rendering._result_schema({"Metadata": {}}))
         self.assertEqual(rendering.SUPPORTED_SCHEMAS,
-                         ("cosmos-e2e-result/v1", "ego.annotation.product_json.v3"))
+                         ("cosmos-e2e-result/v1", "cosmos-e2e-result/v2", "ego.annotation.product_json.v3"))
 
-    def test_unsupported_schema_names_both_documented_results(self):
+    def test_unsupported_schema_names_every_documented_result(self):
         self.document = {"schema": "ego.annotation.product_json.v4"}
         self.write()
-        self.rejected("accepts cosmos-e2e-result/v1 or ego.annotation.product_json.v3")
+        self.rejected("accepts cosmos-e2e-result/v1 or cosmos-e2e-result/v2 or ego.annotation.product_json.v3")
 
     def test_metadata_must_carry_the_dag_schema(self):
         # A top-level schema selects the reader; Metadata.schema is the DAG's
@@ -405,7 +533,7 @@ class DagResultTests(unittest.TestCase):
         self.video.write_bytes(b"placeholder")
         camera = self.root / "camera.json"
         camera.write_text("{}", encoding="utf-8")
-        with self.assertRaisesRegex(ClientError, "--camera applies to cosmos-e2e-result/v1"):
+        with self.assertRaisesRegex(ClientError, "--camera applies to Cosmos e2e results"):
             rendering.render_video_result(self.result, self.video, self.output, camera=str(camera))
 
     def test_mano_directory_is_validated_before_rendering(self):
@@ -570,6 +698,11 @@ class RealDagRenderTests(DagRenderCase):
         document = physical_result()
         document["action"] = document["action"][:2]
         self.save_json(self.result, document)
+        rendering.render_video_result(self.result, self.video, self.output)
+        self.assertEqual(int(self.probe(self.output)["nb_read_frames"]), 3)
+
+    def test_cosmos_v2_result_renders_from_the_exact_video(self):
+        self.save_json(self.result, physical_result_v2())
         rendering.render_video_result(self.result, self.video, self.output)
         self.assertEqual(int(self.probe(self.output)["nb_read_frames"]), 3)
 

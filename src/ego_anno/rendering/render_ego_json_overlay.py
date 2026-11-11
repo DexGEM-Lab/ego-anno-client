@@ -535,12 +535,13 @@ def _subtitle_for_frame(rows: list[dict], frame_index: int, cursor: int, *, cosm
 
 def _load_document(path: Path, camera_path: Path | None = None) -> tuple[dict, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray]:
     document = json.loads(path.read_text(encoding="utf-8"))
-    if document.get("schema") == "cosmos-e2e-result/v1":
+    schema = document.get("schema")
+    if schema in ("cosmos-e2e-result/v1", "cosmos-e2e-result/v2"):
         if __package__:
-            from .cosmos_e2e import CosmosE2EDocument
+            from .cosmos_e2e import CosmosE2EDocument, CosmosE2EHeadDocument
         else:
             try:
-                from cosmos_e2e import CosmosE2EDocument
+                from cosmos_e2e import CosmosE2EDocument, CosmosE2EHeadDocument
             except ModuleNotFoundError as exc:
                 if exc.name != "cosmos_e2e":
                     raise
@@ -550,10 +551,12 @@ def _load_document(path: Path, camera_path: Path | None = None) -> tuple[dict, n
                 module = module_from_spec(spec)
                 spec.loader.exec_module(module)
                 CosmosE2EDocument = module.CosmosE2EDocument
+                CosmosE2EHeadDocument = module.CosmosE2EHeadDocument
         camera = json.loads(camera_path.read_text(encoding="utf-8")) if camera_path is not None else None
-        document = CosmosE2EDocument.convert(document, camera)
+        converter = CosmosE2EDocument if schema == "cosmos-e2e-result/v1" else CosmosE2EHeadDocument
+        document = converter.convert(document, camera)
     elif camera_path is not None:
-        raise SystemExit("--camera is only supported for cosmos-e2e-result/v1 JSON")
+        raise SystemExit("--camera is only supported for Cosmos e2e JSON")
     metadata = document["Metadata"]
     frames = document["逐帧轨迹"]
     frame_count = int(metadata["帧数"])
@@ -601,7 +604,7 @@ def _load_assets_if_needed(asset_dir: Path, joints: list[np.ndarray], betas: lis
 
 
 def _is_cosmos(document: dict) -> bool:
-    return document["Metadata"].get("source_schema") == "cosmos-e2e-result/v1"
+    return document["Metadata"].get("source_schema") in ("cosmos-e2e-result/v1", "cosmos-e2e-result/v2")
 
 
 def _output_fps(document: dict, requested: float | None, legacy_fps: float | None = None) -> float:
