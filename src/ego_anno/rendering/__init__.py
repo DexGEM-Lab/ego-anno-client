@@ -261,10 +261,14 @@ def _check_mano_dir(mano_dir):
     root = Path(mano_dir).expanduser().resolve()
     if not root.is_dir():
         raise ClientError("hand-model asset directory does not exist: {}".format(root))
-    for name in ("MANO_LEFT.pkl", "MANO_RIGHT.pkl", "mano_runtime.npz"):
-        if not (root / name).is_file():
-            raise ClientError("hand-model asset directory is missing {}: {}".format(name, root))
-    return root
+    standard = (root / "HAND_LEFT.pkl", root / "HAND_RIGHT.pkl")
+    legacy = (root / "MANO_LEFT.pkl", root / "MANO_RIGHT.pkl", root / "mano_runtime.npz")
+    if all(path.is_file() for path in standard) or all(path.is_file() for path in legacy):
+        return root
+    if not standard[0].is_file() and not legacy[0].is_file():
+        raise ClientError("hand-model asset directory is missing MANO_LEFT.pkl or HAND_LEFT.pkl: {}".format(root))
+    missing = next(path.name for path in (*standard, *legacy) if not path.is_file())
+    raise ClientError("hand-model asset directory is missing {}: {}".format(missing, root))
 
 
 def _validate_dag_document(document):

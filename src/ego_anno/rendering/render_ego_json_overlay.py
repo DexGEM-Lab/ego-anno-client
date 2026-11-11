@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import pickle
 from pathlib import Path
 import shutil
 import tempfile
@@ -35,11 +36,15 @@ HAND_EDGES = (
     (0, 13), (13, 14), (14, 15), (15, 16),
     (0, 17), (17, 18), (18, 19), (19, 20),
 )
-HAND_COLORS = ((76, 220, 92), (42, 205, 255))  # BGR: left green, right yellow
+# RRD constants are RGB; OpenCV rasterizes them as BGR.
+HAND_COLORS = ((90, 225, 70), (40, 205, 255))  # left green, right yellow
+KEYPOINT_COLOR = (40, 40, 255)                 # RRD KEYPOINT_RGBA red
+SKIN_COLOR = (160, 205, 240)                   # RRD SKIN_RGBA
+CAMERA_COLOR = (40, 40, 220)                   # RRD CAM_RGBA
+TRAIL_COLOR = (255, 180, 60)                   # RRD TRAIL_RGBA
+GRID_COLOR = (215, 205, 200)                  # RRD GRID_RGBA converted to BGR
 BG = (26, 29, 33)
-HEAD_COLOR = (60, 80, 255)
 OUTLINE = (3, 3, 3)
-TRAJ_COLOR = (90, 105, 200)
 
 # MANO's 16 kinematic joints mapped to the JSON/OpenPose-style 21-joint order.
 MANO16_TO_JSON21 = np.asarray((0, 5, 6, 7, 9, 10, 11, 17, 18, 19, 13, 14, 15, 1, 2, 3), dtype=np.int64)
@@ -90,24 +95,80 @@ def _palm_rotation(rest_joints: np.ndarray, target_joints: np.ndarray) -> np.nda
     return q.T  # column-vector map
 
 
+class _LegacyArrayStub:
+    """Local placeholder for legacy chumpy wrappers in the hand pickles."""
+
+
+class _HandModelUnpickler(pickle.Unpickler):
+    """Load only the numpy/scipy globals needed by the standard hand assets."""
+
+    _ALLOWED = {
+        ("__builtin__", "set"),
+        ("builtins", "set"),
+        ("chumpy.ch", "Ch"),
+        ("chumpy.reordering", "Select"),
+        ("numpy", "dtype"),
+        ("numpy", "ndarray"),
+        ("numpy.core.multiarray", "_reconstruct"),
+        ("numpy.random", "RandomState"),
+        ("numpy.random", "MT19937"),
+        ("scipy.sparse", "csc_matrix"),
+        ("scipy.sparse.csc", "csc_matrix"),
+        ("scipy.sparse._csc", "csc_matrix"),
+    }
+
+    def find_class(self, module: str, name: str):
+        if (module, name) not in self._ALLOWED:
+            raise pickle.UnpicklingError(f"unsupported pickle global in hand asset: {module}.{name}")
+        if (module, name) in (("chumpy.ch", "Ch"), ("chumpy.reordering", "Select")):
+            return _LegacyArrayStub
+        return super().find_class(module, name)
+
+
+def _load_standard_hand_model(path: Path) -> dict[str, np.ndarray]:
+    if not path.is_file():
+        raise SystemExit(f"missing bundled hand-model asset: {path}")
+    with path.open("rb") as stream:
+        raw = _HandModelUnpickler(stream, encoding="latin1").load()
+    wrapped = raw["shapedirs"]
+    shapedirs = np.asarray(wrapped.a.x, dtype=np.float64).reshape(-1)[wrapped.idxs].reshape(wrapped.preferred_shape)
+    regressor = raw["J_regressor"]
+    if hasattr(regressor, "toarray"):
+        regressor = regressor.toarray()
+    return {
+        "v_template": np.asarray(raw["v_template"], dtype=np.float64),
+        "shapedirs": shapedirs,
+        "J_regressor": np.asarray(regressor, dtype=np.float64),
+        "weights": np.asarray(raw["weights"], dtype=np.float64),
+        "faces": np.asarray(raw["f"], dtype=np.int32),
+    }
+
+
 class HandSurfaceAssets:
-    """Numpy runtime representation extracted from the bundled left/right PKLs."""
+    """Runtime standard-hand assets matching the RRD renderer's loader."""
 
     def __init__(self, asset_dir: Path):
-        runtime_path = asset_dir / "mano_runtime.npz"
-        for required in (asset_dir / "MANO_LEFT.pkl", asset_dir / "MANO_RIGHT.pkl", runtime_path):
-            if not required.is_file():
-                raise SystemExit(f"missing bundled hand-model asset: {required}")
-        archive = np.load(runtime_path)
-        self.models: dict[str, dict[str, np.ndarray]] = {}
-        for side in ("left", "right"):
-            self.models[side] = {
-                "v_template": np.asarray(archive[f"{side}_v_template"], dtype=np.float64),
-                "shapedirs": np.asarray(archive[f"{side}_shapedirs"], dtype=np.float64),
-                "J_regressor": np.asarray(archive[f"{side}_J_regressor"], dtype=np.float64),
-                "weights": np.asarray(archive[f"{side}_weights"], dtype=np.float64),
-                "faces": np.asarray(archive[f"{side}_f"], dtype=np.int32),
+        standard = (asset_dir / "HAND_LEFT.pkl", asset_dir / "HAND_RIGHT.pkl")
+        legacy = (asset_dir / "MANO_LEFT.pkl", asset_dir / "MANO_RIGHT.pkl", asset_dir / "mano_runtime.npz")
+        if all(path.is_file() for path in standard):
+            self.models = {
+                "left": _load_standard_hand_model(standard[0]),
+                "right": _load_standard_hand_model(standard[1]),
             }
+        elif all(path.is_file() for path in legacy):
+            archive = np.load(legacy[2])
+            self.models = {
+                side: {
+                    "v_template": np.asarray(archive[f"{side}_v_template"], dtype=np.float64),
+                    "shapedirs": np.asarray(archive[f"{side}_shapedirs"], dtype=np.float64),
+                    "J_regressor": np.asarray(archive[f"{side}_J_regressor"], dtype=np.float64),
+                    "weights": np.asarray(archive[f"{side}_weights"], dtype=np.float64),
+                    "faces": np.asarray(archive[f"{side}_f"], dtype=np.int32),
+                }
+                for side in ("left", "right")
+            }
+        else:
+            raise SystemExit(f"missing standard hand assets in {asset_dir}: expected HAND_LEFT.pkl and HAND_RIGHT.pkl")
         self._shape_cache: dict[tuple[str, tuple[float, ...]], tuple[np.ndarray, np.ndarray]] = {}
 
     def shaped(self, side: str, beta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -317,11 +378,12 @@ def _draw_world_skeleton(canvas: np.ndarray, joints_world: np.ndarray, view: dic
         pb = tuple(np.rint(pixels[b]).astype(int))
         cv2.line(canvas, pa, pb, OUTLINE, 5, cv2.LINE_AA)
         cv2.line(canvas, pa, pb, color, 3, cv2.LINE_AA)
+    # RRD uses red keypoint dots independently of the left/right skeleton hue.
     for index, point in enumerate(pixels):
         if valid[index]:
             p = tuple(np.rint(point).astype(int))
             cv2.circle(canvas, p, 4, OUTLINE, -1, cv2.LINE_AA)
-            cv2.circle(canvas, p, 2, color, -1, cv2.LINE_AA)
+            cv2.circle(canvas, p, 2, KEYPOINT_COLOR, -1, cv2.LINE_AA)
 
 
 def _build_cinema_camera(s: float = 0.07) -> tuple[np.ndarray, np.ndarray]:
@@ -392,10 +454,10 @@ def _draw_frustum(canvas: np.ndarray, pose: np.ndarray, intrinsic: np.ndarray,
     points = _camera_frustum_points(pose, intrinsic, source_size)
     center, axis, corners = points[0], points[1], points[2:]
     for endpoint in corners:
-        _draw_view_line(canvas, np.asarray((center, endpoint)), view, HEAD_COLOR, 2)
+        _draw_view_line(canvas, np.asarray((center, endpoint)), view, CAMERA_COLOR, 2)
     for index in range(4):
-        _draw_view_line(canvas, np.asarray((corners[index], corners[(index + 1) % 4])), view, HEAD_COLOR, 2)
-    _draw_view_line(canvas, np.asarray((center, axis)), view, (255, 210, 80), 2)
+        _draw_view_line(canvas, np.asarray((corners[index], corners[(index + 1) % 4])), view, CAMERA_COLOR, 2)
+    _draw_view_line(canvas, np.asarray((center, axis)), view, CAMERA_COLOR, 2)
 
 
 def _camera_marker_points(pose: np.ndarray, scale: float = 0.026) -> tuple[np.ndarray, list[tuple[int, int]]]:
@@ -418,18 +480,47 @@ def _camera_marker_points(pose: np.ndarray, scale: float = 0.026) -> tuple[np.nd
 def _draw_camera_marker(canvas: np.ndarray, pose: np.ndarray, view: dict[str, np.ndarray | float]) -> None:
     points, edges = _camera_marker_points(pose)
     pixels, _, valid, _ = _project_view(points, view, (canvas.shape[1], canvas.shape[0]))
-    axis_colors = {(0, 5): (70, 100, 255), (0, 6): (70, 230, 90), (0, 7): (255, 210, 80)}
+    axis_colors = {(0, 5): CAMERA_COLOR, (0, 6): CAMERA_COLOR, (0, 7): CAMERA_COLOR}
     for a, b in edges:
         if not (valid[a] and valid[b]):
             continue
-        color = axis_colors.get((a, b), HEAD_COLOR)
+        color = axis_colors.get((a, b), CAMERA_COLOR)
         pa, pb = tuple(np.rint(pixels[a]).astype(int)), tuple(np.rint(pixels[b]).astype(int))
         cv2.line(canvas, pa, pb, OUTLINE, 4, cv2.LINE_AA)
         cv2.line(canvas, pa, pb, color, 2, cv2.LINE_AA)
 
 
+def _follow_anchor(pose: np.ndarray, centers: np.ndarray, frame_index: int,
+                   frame_joints: list[np.ndarray]) -> np.ndarray:
+    """Smooth camera translation while keeping the current hand cluster centered."""
+    center = np.asarray(pose[:3, 3], dtype=np.float64)
+    end = min(len(centers), frame_index + 1)
+    start = max(0, end - 8)
+    recent = np.asarray(centers[start:end], dtype=np.float64)
+    valid = np.isfinite(recent).all(axis=1)
+    if valid.any():
+        weights = np.exp(np.linspace(-1.4, 0.0, int(valid.sum())))
+        smoothed = np.average(recent[valid], axis=0, weights=weights)
+    else:
+        smoothed = center
+    rotation = np.asarray(pose[:3, :3], dtype=np.float64)
+    right, down = rotation[:, 0], rotation[:, 1]
+    hands = [np.asarray(j, dtype=np.float64) for j in frame_joints
+             if np.asarray(j).shape == (21, 3) and np.isfinite(j).all()]
+    if hands:
+        scene = np.concatenate(hands, axis=0).mean(axis=0)
+        # Do not move along forward: that would put the camera behind the eye.
+        # A modest lateral/vertical correction gives centroid-following without
+        # the spinning/zooming behavior of a free world-space orbit.
+        offset = scene - center
+        smoothed = smoothed + right * (0.22 * float(np.dot(offset, right)))
+        smoothed = smoothed + down * (0.22 * float(np.dot(offset, down)))
+    return smoothed
+
+
 def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, height: int,
-               extra_points: np.ndarray | None = None) -> dict[str, np.ndarray | float]:
+               extra_points: np.ndarray | None = None,
+               follow_anchor: np.ndarray | None = None) -> dict[str, np.ndarray | float]:
     rotation = np.asarray(pose[:3, :3], dtype=np.float64)
     center = np.asarray(pose[:3, 3], dtype=np.float64)
     right = _normalize(rotation[:, 0], np.asarray([1.0, 0.0, 0.0]))
@@ -450,7 +541,8 @@ def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, hei
     # The camera basis is used directly, so this is a stable side-rear follow
     # view rather than a world-up orbit that can spin as the camera moves.
     lateral_offset = 0.42
-    eye = (center - forward * observer_distance
+    anchor = center if follow_anchor is None else np.asarray(follow_anchor, dtype=np.float64)
+    eye = (anchor - forward * observer_distance
            + right * (lateral_offset * observer_distance)
            - down * (0.20 * observer_distance))
     view: dict[str, np.ndarray | float] = {
@@ -486,24 +578,31 @@ def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, hei
     return view
 
 
-def _draw_camera_grid(canvas: np.ndarray, pose: np.ndarray, joints: list[np.ndarray], view: dict[str, np.ndarray | float]) -> None:
-    rotation = np.asarray(pose[:3, :3], dtype=np.float64)
-    center = np.asarray(pose[:3, 3], dtype=np.float64)
-    right, down, forward = rotation[:, 0], rotation[:, 1], rotation[:, 2]
-    valid_hands = [np.asarray(j, dtype=np.float64) for j in joints if np.asarray(j).shape == (21, 3) and np.isfinite(j).all()]
-    if valid_hands:
-        camera_hand = _camera_coordinates(np.concatenate(valid_hands, axis=0), pose)
-        floor_down = float(np.percentile(camera_hand[:, 1], 95) + 0.09)
-        z_end = float(max(0.8, np.percentile(camera_hand[:, 2], 98) + 0.18))
-        x_half = float(max(0.45, np.percentile(np.abs(camera_hand[:, 0]), 98) + 0.15))
-    else:
-        floor_down, z_end, x_half = 0.35, 0.8, 0.45
-    for x in np.linspace(-x_half, x_half, 9):
-        points = np.asarray((center + right * x + down * floor_down, center + right * x + down * floor_down + forward * z_end))
-        _draw_view_line(canvas, points, view, (52, 61, 71), 1)
-    for z in np.linspace(0.0, z_end, 9):
-        points = np.asarray((center - right * x_half + down * floor_down + forward * z, center + right * x_half + down * floor_down + forward * z))
-        _draw_view_line(canvas, points, view, (52, 61, 71), 1)
+def _draw_camera_grid(canvas: np.ndarray, pose: np.ndarray, joints: list[np.ndarray],
+                      view: dict[str, np.ndarray | float]) -> None:
+    """Rasterize render_rerun.py's fixed faint RDF ground grid.
+
+    The v3 EgoDex coordinates in this result are already camera/world RDF: +Y
+    is down and +Z is camera-forward.  The RRD grid therefore stays on y=0.15
+    in world coordinates instead of being rebuilt from the current view basis.
+    """
+    del pose, joints
+    grid_lines: list[np.ndarray] = []
+    grid_y = 0.15
+    for gx in np.arange(-2.0, 2.25, 0.5):
+        grid_lines.append(np.asarray(((gx, grid_y, -2.0), (gx, grid_y, 2.0)), dtype=np.float64))
+    for gz in np.arange(-2.0, 2.25, 0.5):
+        grid_lines.append(np.asarray(((-2.0, grid_y, gz), (2.0, grid_y, gz)), dtype=np.float64))
+    alpha = 40.0 / 255.0
+    for points in grid_lines:
+        pixels, _, valid, _ = _project_view(points, view, (canvas.shape[1], canvas.shape[0]))
+        if not valid.all():
+            continue
+        layer = canvas.copy()
+        a = tuple(np.rint(pixels[0]).astype(int))
+        b = tuple(np.rint(pixels[1]).astype(int))
+        cv2.line(layer, a, b, GRID_COLOR, 1, cv2.LINE_AA)
+        cv2.addWeighted(layer, alpha, canvas, 1.0 - alpha, 0.0, canvas)
 
 
 def _resize_to_contain(frame: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -773,25 +872,25 @@ def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, 
     canvas = np.full((height, width, 3), BG, dtype=np.uint8)
     cam_verts, cam_faces = _build_cinema_camera()
     cam_world = (np.asarray(pose[:3, :3], dtype=np.float64) @ cam_verts.T).T + pose[:3, 3]
-    if intrinsic is not None and source_size is not None:
-        frustum = _camera_frustum_points(pose, intrinsic, source_size)
-    else:
-        frustum = np.empty((0, 3), dtype=np.float64)
     # Frame the camera body and hands; the frustum is an explanatory overlay and
     # may extend toward the image border without making both subjects tiny.
-    view = _rear_view(pose, frame_joints, width, height, cam_world)
+    follow_anchor = _follow_anchor(pose, centers, frame_index, frame_joints)
+    view = _rear_view(pose, frame_joints, width, height, cam_world, follow_anchor)
     _draw_camera_grid(canvas, pose, frame_joints, view)
     trajectory = centers[np.isfinite(centers).all(axis=1)]
-    if len(trajectory) >= 2:
-        _draw_view_line(canvas, trajectory, view, TRAJ_COLOR, 2)
 
-    # Match the RRD world content: a detailed red cinema camera mesh and RDF pinhole frustum.
+    # Match the RRD world content: a solid red cinema-camera mesh and red
+    # pinhole/frustum lines. Rerun's Mesh3D has no hand-drawn black edges.
     pixels, _, _, xyz = _project_view(cam_world, view, (width, height))
-    _draw_mesh_pixels(canvas, pixels, xyz, cam_faces, (40, 40, 220), alpha=1.0, edges=True)
+    _draw_mesh_pixels(canvas, pixels, xyz, cam_faces, CAMERA_COLOR, alpha=1.0, edges=False)
     if intrinsic is not None and source_size is not None:
         _draw_frustum(canvas, pose, intrinsic, source_size, view)
+    # Keep the static trajectory readable when it passes through the current
+    # camera body; this is the raster equivalent of Rerun's depth-tested trail.
+    if len(trajectory) >= 2:
+        _draw_view_line(canvas, trajectory, view, TRAIL_COLOR, 2)
 
-    skin_color = (160, 205, 240)  # BGR: bright, pale skin tone
+    skin_color = SKIN_COLOR
     for side in range(2):
         joints_world = frame_joints[side]
         if np.asarray(joints_world).shape != (21, 3) or not np.isfinite(joints_world).all():
@@ -803,9 +902,8 @@ def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, 
         elif frame_betas is None or not _has_beta(frame_betas[side]):
             _draw_world_skeleton(canvas, joints_world, view, HAND_COLORS[side])
 
-    # Draw the camera last so it covers hand pixels at every 2D overlap.
-    # Painter order gives the requested hierarchy without slow depth rasterization.
-    _draw_camera_marker(canvas, pose, view)
+    # Painter order matches the spatial view: camera geometry is the anchor and
+    # hands remain readable where the two objects overlap.
     cv2.putText(canvas, "side-rear follow view: camera and hands", (16, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (245, 245, 245), 2, cv2.LINE_AA)
     cv2.putText(canvas, f"frame {frame_index + 1:06d} | camera right/down/forward coordinates | units: meters", (16, height - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (225, 232, 240), 1, cv2.LINE_AA)
     skeleton_visible = any(
