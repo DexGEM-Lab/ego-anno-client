@@ -324,6 +324,80 @@ def _draw_world_skeleton(canvas: np.ndarray, joints_world: np.ndarray, view: dic
             cv2.circle(canvas, p, 2, color, -1, cv2.LINE_AA)
 
 
+def _build_cinema_camera(s: float = 0.07) -> tuple[np.ndarray, np.ndarray]:
+    """Return the detailed RDF cinema-camera mesh used by the RRD spatial view."""
+    verts: list[list[float]] = []
+    faces: list[list[int]] = []
+
+    def add_box(cx: float, cy: float, cz: float, w: float, h: float, d: float) -> None:
+        base = len(verts)
+        for dx, dy, dz in ((-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+                           (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)):
+            verts.append([cx + dx * w / 2, cy + dy * h / 2, cz + dz * d / 2])
+        for face in ((0, 1, 2), (0, 2, 3), (4, 6, 5), (4, 7, 6),
+                     (0, 4, 5), (0, 5, 1), (2, 6, 7), (2, 7, 3),
+                     (0, 3, 7), (0, 7, 4), (1, 5, 6), (1, 6, 2)):
+            faces.append([base + index for index in face])
+
+    def add_cylinder(cx: float, cy: float, cz: float, radius: float, length: float,
+                     n: int = 16, axis: str = "z") -> None:
+        base = len(verts)
+        for index in range(n):
+            angle = 2 * np.pi * index / n
+            if axis == "z":
+                verts.extend(([cx + radius * np.cos(angle), cy + radius * np.sin(angle), cz],
+                              [cx + radius * np.cos(angle), cy + radius * np.sin(angle), cz + length]))
+            else:
+                verts.extend(([cx + radius * np.cos(angle), cy, cz + radius * np.sin(angle)],
+                              [cx + radius * np.cos(angle), cy + length, cz + radius * np.sin(angle)]))
+        for index in range(n):
+            nxt = (index + 1) % n
+            faces.extend(([base + 2 * index, base + 2 * nxt, base + 2 * nxt + 1],
+                          [base + 2 * index, base + 2 * nxt + 1, base + 2 * index + 1]))
+
+    add_box(0, 0, 0, s * 1.4, s * 0.9, s * 0.8)
+    add_box(0, -s * 0.55, -s * 0.1, s * 0.8, s * 0.15, s * 0.5)
+    add_box(-s * 0.35, -s * 0.48, -s * 0.1, s * 0.08, s * 0.12, s * 0.3)
+    add_box(s * 0.35, -s * 0.48, -s * 0.1, s * 0.08, s * 0.12, s * 0.3)
+    add_cylinder(0, 0, s * 0.4, s * 0.45, s * 0.35, n=20)
+    add_cylinder(0, 0, s * 0.4 + s * 0.35, s * 0.48, s * 0.06, n=20)
+    add_box(0, -s * 0.15, -s * 0.5, s * 0.5, s * 0.35, s * 0.2)
+    return np.asarray(verts, dtype=np.float64), np.asarray(faces, dtype=np.int32)
+
+
+def _camera_frustum_points(pose: np.ndarray, intrinsic: np.ndarray, source_size: tuple[int, int], depth: float = 0.18) -> np.ndarray:
+    """Return camera center, optical axis and far pinhole corners in world RDF coordinates."""
+    width, height = source_size
+    intrinsic = np.asarray(intrinsic, dtype=np.float64)
+    if not np.isfinite(intrinsic).all() or intrinsic.shape != (3, 3):
+        focal_x = focal_y = max(width, height)
+        cx, cy = width * 0.5, height * 0.5
+    else:
+        focal_x, focal_y = float(intrinsic[0, 0]), float(intrinsic[1, 1])
+        cx, cy = float(intrinsic[0, 2]), float(intrinsic[1, 2])
+        if focal_x <= 1e-6 or focal_y <= 1e-6:
+            focal_x = focal_y = max(width, height)
+    pixels = np.asarray(((0, 0), (width, 0), (width, height), (0, height)), dtype=np.float64)
+    camera = np.column_stack(((pixels[:, 0] - cx) * depth / focal_x,
+                              (pixels[:, 1] - cy) * depth / focal_y,
+                              np.full(4, depth)))
+    center = np.asarray(pose[:3, 3], dtype=np.float64)
+    rotation = np.asarray(pose[:3, :3], dtype=np.float64)
+    corners = (rotation @ camera.T).T + center
+    return np.vstack((center, center + rotation[:, 2] * depth, corners))
+
+
+def _draw_frustum(canvas: np.ndarray, pose: np.ndarray, intrinsic: np.ndarray,
+                  source_size: tuple[int, int], view: dict[str, np.ndarray | float]) -> None:
+    points = _camera_frustum_points(pose, intrinsic, source_size)
+    center, axis, corners = points[0], points[1], points[2:]
+    for endpoint in corners:
+        _draw_view_line(canvas, np.asarray((center, endpoint)), view, HEAD_COLOR, 2)
+    for index in range(4):
+        _draw_view_line(canvas, np.asarray((corners[index], corners[(index + 1) % 4])), view, HEAD_COLOR, 2)
+    _draw_view_line(canvas, np.asarray((center, axis)), view, (255, 210, 80), 2)
+
+
 def _camera_marker_points(pose: np.ndarray, scale: float = 0.026) -> tuple[np.ndarray, list[tuple[int, int]]]:
     center = np.asarray(pose[:3, 3], dtype=np.float64)
     rotation = np.asarray(pose[:3, :3], dtype=np.float64)
@@ -354,7 +428,8 @@ def _draw_camera_marker(canvas: np.ndarray, pose: np.ndarray, view: dict[str, np
         cv2.line(canvas, pa, pb, color, 2, cv2.LINE_AA)
 
 
-def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, height: int) -> dict[str, np.ndarray | float]:
+def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, height: int,
+               extra_points: np.ndarray | None = None) -> dict[str, np.ndarray | float]:
     rotation = np.asarray(pose[:3, :3], dtype=np.float64)
     center = np.asarray(pose[:3, 3], dtype=np.float64)
     right = _normalize(rotation[:, 0], np.asarray([1.0, 0.0, 0.0]))
@@ -390,6 +465,8 @@ def _rear_view(pose: np.ndarray, frame_joints: list[np.ndarray], width: int, hei
     }
     marker, _ = _camera_marker_points(pose)
     required = np.vstack((marker, merged)) if len(merged) else marker
+    if extra_points is not None and np.asarray(extra_points).size:
+        required = np.vstack((required, np.asarray(extra_points, dtype=np.float64).reshape(-1, 3)))
     xyz = _view_coordinates(required, view)
     valid = np.isfinite(xyz).all(axis=1) & (xyz[:, 2] > 1e-5)
     if valid.any():
@@ -690,16 +767,29 @@ def _render_source_hand(source: np.ndarray, side: int, joints_world: np.ndarray,
 
 def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, frame_index: int,
                   frame_joints: list[np.ndarray], meshes: list[np.ndarray | None], assets: HandSurfaceAssets | None,
-                  frame_betas: list[np.ndarray] | None = None) -> np.ndarray:
+                  frame_betas: list[np.ndarray] | None = None, intrinsic: np.ndarray | None = None,
+                  source_size: tuple[int, int] | None = None) -> np.ndarray:
     width, height = size
     canvas = np.full((height, width, 3), BG, dtype=np.uint8)
-    view = _rear_view(pose, frame_joints, width, height)
+    cam_verts, cam_faces = _build_cinema_camera()
+    cam_world = (np.asarray(pose[:3, :3], dtype=np.float64) @ cam_verts.T).T + pose[:3, 3]
+    if intrinsic is not None and source_size is not None:
+        frustum = _camera_frustum_points(pose, intrinsic, source_size)
+    else:
+        frustum = np.empty((0, 3), dtype=np.float64)
+    # Frame the camera body and hands; the frustum is an explanatory overlay and
+    # may extend toward the image border without making both subjects tiny.
+    view = _rear_view(pose, frame_joints, width, height, cam_world)
     _draw_camera_grid(canvas, pose, frame_joints, view)
-    start = max(0, frame_index - 90)
-    trajectory = centers[start:frame_index + 1]
-    trajectory = trajectory[np.isfinite(trajectory).all(axis=1)]
+    trajectory = centers[np.isfinite(centers).all(axis=1)]
     if len(trajectory) >= 2:
         _draw_view_line(canvas, trajectory, view, TRAJ_COLOR, 2)
+
+    # Match the RRD world content: a detailed red cinema camera mesh and RDF pinhole frustum.
+    pixels, _, _, xyz = _project_view(cam_world, view, (width, height))
+    _draw_mesh_pixels(canvas, pixels, xyz, cam_faces, (40, 40, 220), alpha=1.0, edges=True)
+    if intrinsic is not None and source_size is not None:
+        _draw_frustum(canvas, pose, intrinsic, source_size, view)
 
     skin_color = (160, 205, 240)  # BGR: bright, pale skin tone
     for side in range(2):
@@ -846,7 +936,8 @@ def main() -> int:
 
             if pose_valid[frame_index]:
                 world = _render_world((pane_width, pane_height), poses[frame_index], centers, frame_index, frame_joints, meshes, assets,
-                                      [betas[0][frame_index], betas[1][frame_index]])
+                                      [betas[0][frame_index], betas[1][frame_index]], intrinsic,
+                                      (source_width, source_height))
                 for side, side_name in ((0, "left"), (1, "right")):
                     if meshes[side] is not None:
                         world_mesh_faces += len(assets.faces(side_name))

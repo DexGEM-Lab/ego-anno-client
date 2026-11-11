@@ -596,6 +596,29 @@ class DagResultTests(unittest.TestCase):
             # The lateral offset is in the camera-right basis, with no world-up spin.
             self.assertGreater(float(np.dot(view["eye"] - pose[:3, 3], pose[:3, 0])), 0.0)
 
+    def test_spatial_scene_contains_camera_mesh_frustum_and_full_trail(self):
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        vertices, faces = renderer._build_cinema_camera()
+        self.assertGreater(len(vertices), 80)
+        self.assertGreater(len(faces), 100)
+        pose = np.eye(4, dtype=float)
+        pose[:3, 3] = [0.3, 0.0, 0.0]
+        world = (pose[:3, :3] @ vertices.T).T + pose[:3, 3]
+        np.testing.assert_allclose(world - vertices, np.tile([0.3, 0.0, 0.0], (len(vertices), 1)))
+        frustum = renderer._camera_frustum_points(pose, self.document["Metadata"]["相机内参"], (640, 480))
+        self.assertEqual(frustum.shape, (6, 3))
+        self.assertTrue(np.isfinite(frustum).all())
+        centers = np.asarray([[-0.8, 0, 0], [0.3, 0, 0], [1.2, 0, 0]], dtype=float)
+        hand = np.asarray(self.document["逐帧轨迹"][0]["帧1"]["手0"]["手部21点坐标"], dtype=float) + pose[:3, 3]
+        rendered = renderer._render_world((640, 400), pose, centers, 2, [hand, hand], [None, None], None,
+                                          [np.full(10, np.nan), np.full(10, np.nan)],
+                                          np.asarray(self.document["Metadata"]["相机内参"], dtype=float), (640, 480))
+        self.assertEqual(rendered.shape, (400, 640, 3))
+        # Red cinema camera/frustum pixels and blue full-trail pixels are painted.
+        self.assertGreater(int(((rendered[:, :, 2] > 120) & (rendered[:, :, 2] > rendered[:, :, 1] * 1.5)).sum()), 20)
+        self.assertGreater(int(((rendered[:, :, 0] > 80) & (rendered[:, :, 2] > 80)).sum()), 20)
+
     def test_render_labels_are_english(self):
         source = Path(importlib.import_module("ego_anno.rendering.render_ego_json_overlay").__file__).read_text(encoding="utf-8")
         self.assertIn("Hand joints overlay", source)
