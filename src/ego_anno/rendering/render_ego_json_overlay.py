@@ -42,10 +42,22 @@ KEYPOINT_COLOR = (40, 40, 255)                 # RRD KEYPOINT_RGBA red
 SKIN_COLOR = (160, 205, 240)                   # RRD SKIN_RGBA [240, 205, 160]
 CAMERA_COLOR = (22, 25, 28)                   # near-black cinema camera (BGR)
 TRAIL_COLOR = (255, 180, 60)                   # RRD TRAIL_RGBA [60, 180, 255]
-# Vertical eye offset as a multiple of the standoff `d`. Together with the 0.9
-# forward and 0.5 lateral offsets this is the observer's elevation above the
-# anchor: atan2(0.67, hypot(0.9, 0.5)) = 33.0 deg.
-_EYE_ELEVATION = 0.67
+# Observer geometry relative to the smoothed horizontal heading: behind it,
+# swung to one side by _EYE_AZIMUTH, raised _EYE_ELEVATION above the
+# horizontal plane through the anchor (both in degrees, measured against the
+# estimated world-up, never against the ego camera's own axes).
+_EYE_AZIMUTH = 35.0
+_EYE_ELEVATION = 32.0
+# Standoff band and the 5 cm / 15 deg deadbands that turn head jitter into
+# exactly zero observer motion.
+_EYE_DISTANCE_RANGE = (0.7, 1.6)
+_ANCHOR_DEADBAND_M = 0.05
+_HEADING_DEADBAND_DEG = 15.0
+_OBSERVER_MAX_SPEED = 0.6
+# Assumed head pitch (deg, forward-down) when the clip's yaw spread cannot
+# pin world-up: the EgoDex median measured on the source recordings.
+_FALLBACK_HEAD_PITCH_DEG = 22.0
+_FLOOR_DROP_M = 0.75
 GRID_COLOR = (91, 89, 83)                     # sampled bright grid core, BGR
 # Rerun's spatial viewport is a dark blue-green shaded floor rather than the
 # neutral gray used by the old overlay.  Corners are sampled from the target
@@ -554,12 +566,11 @@ def _fit_focal(points: np.ndarray, view: dict[str, np.ndarray | float],
                cx0: float | None = None, cy0: float | None = None) -> float:
     """Largest focal length that keeps every point `margin` px inside the pane.
 
-    The extent is centred at (cx0, cy0), which is NOT the pane centre -- the
-    spatial view sits slightly low (cy = 0.54h) so the floor grid reads. An
-    off-centre framing shrinks the usable box on one side, so the fit uses the
-    smaller of the two distances to each pair of edges; assuming a symmetric
-    box here is what let the bottom margin collapse to ~21 px against a 55 px
-    target.
+    The principal point (cx0, cy0) is NOT the pane centre -- the spatial view
+    sits slightly low (cy = 0.54h) so the floor grid reads -- and the scene is
+    not centred on it either when the observer lags a moving camera. Each
+    point therefore gets its own budget: the pixel distance from the principal
+    point to the edge on its side, divided by its normalised coordinate.
     """
     extent = _frame_extent(points, view)
     if extent is None:
@@ -567,90 +578,377 @@ def _fit_focal(points: np.ndarray, view: dict[str, np.ndarray | float],
     x_min, x_max, y_min, y_max = extent
     cx0 = width * 0.5 if cx0 is None else float(cx0)
     cy0 = height * 0.54 if cy0 is None else float(cy0)
-    # Half-extent in pixels is focal * range / 2 for each axis, so the binding
-    # constraint per axis is twice the smaller distance to the two edges.
-    budget_x = 2.0 * max(min(cx0 - margin, width - margin - cx0), 1.0)
-    budget_y = 2.0 * max(min(cy0 - margin, height - margin - cy0), 1.0)
-    return float(min(budget_x / max(x_max - x_min, 1e-6), budget_y / max(y_max - y_min, 1e-6)))
+    budgets = [float(min(width, height))]
+    for coordinate, room in ((x_max, width - margin - cx0), (-x_min, cx0 - margin),
+                             (-y_min, height - margin - cy0), (y_max, cy0 - margin)):
+        # Pixel-y is flipped: a positive normalised y goes UP the pane, toward
+        # the top edge whose room is cy0 - margin.
+        if coordinate > 1e-9:
+            budgets.append(max(room, 1.0) / coordinate)
+    return float(min(budgets))
 
 
-def _static_follow_view(poses: np.ndarray, pose_valid: np.ndarray, joints: list[np.ndarray],
-                        cam_verts: np.ndarray, width: int, height: int,
-                        margin: float = 0.06) -> dict[str, np.ndarray | float]:
-    """One fixed observer for the entire clip.
+def _gaussian_smooth(values: np.ndarray, sigma_frames: float) -> np.ndarray:
+    """Zero-phase Gaussian smoothing along axis 0 with edge-value padding.
 
-    Orientation keeps the reference character -- behind the camera, a little to
-    its side, and now ~33 deg above it -- but the eye, look-at target and framing
-    are solved ONCE from the bounding extent of the camera body and both hands
-    across every frame. Nothing re-aims or zooms between frames, so the prop and
-    the hands keep a constant screen position and apparent size, and the only
-    per-frame change is the trail growing and the camera prop moving along it.
-
-    The camera's orientation at the clip midpoint supplies the basis. A fixed
-    observer needs one orientation for the whole clip; the median pose is the
-    representative choice and keeps a per-frame rotate/translate from turning
-    into an apparent camera roll.
+    Offline rendering has the whole clip, so a symmetric kernel is used: no lag,
+    no overshoot, and a clip shorter than the kernel collapses to a near-constant
+    track, which is what a static scene should produce.
     """
-    cam_centers = np.asarray(poses[:, :3, 3], dtype=np.float64)
-    valid_centers = cam_centers[np.isfinite(cam_centers).all(axis=1)]
-    if not len(valid_centers):
-        valid_centers = np.zeros((1, 3), dtype=np.float64)
-    anchor = np.median(valid_centers, axis=0)
+    values = np.asarray(values, dtype=np.float64)
+    if sigma_frames <= 0.0 or len(values) < 2:
+        return values.copy()
+    radius = max(1, int(math.ceil(3.0 * sigma_frames)))
+    taps = np.exp(-0.5 * (np.arange(-radius, radius + 1) / sigma_frames) ** 2)
+    taps /= taps.sum()
+    flat = values.reshape(len(values), -1)
+    padded = np.pad(flat, ((radius, radius), (0, 0)), mode="edge")
+    out = np.empty_like(flat)
+    for column in range(flat.shape[1]):
+        out[:, column] = np.convolve(padded[:, column], taps, mode="valid")
+    return out.reshape(values.shape)
 
-    valid_indices = np.flatnonzero(pose_valid)
-    midpoint = int(valid_indices[len(valid_indices) // 2]) if len(valid_indices) else 0
-    rotation = np.asarray(poses[midpoint][:3, :3], dtype=np.float64)
-    if not np.isfinite(rotation).all():
-        rotation = np.eye(3, dtype=np.float64)
-    right = _normalize(rotation[:, 0], np.asarray([1.0, 0.0, 0.0]))
-    down = _normalize(rotation[:, 1], np.asarray([0.0, 1.0, 0.0]))
-    forward = _normalize(rotation[:, 2], np.asarray([0.0, 0.0, 1.0]))
 
-    scene = _clip_scene_points(poses, pose_valid, joints, cam_verts)
-    # The standoff keeps the established band and is driven by the MEDIAN hand
-    # depth over the clip, not by the scene's bounding diagonal. A long traverse
-    # has a large extent because the hands wander metres away from the camera,
-    # and scaling the standoff by that would shove the eye back ~2 m, flattening
-    # the perspective and shrinking the prop and trail to specks. Widening the
-    # framing is the fitted focal's job; the eye stays where the shot reads.
-    depths: list[float] = []
-    for index in np.flatnonzero(pose_valid):
-        merged_rows = [np.asarray(joints[side][index], dtype=np.float64).reshape(-1, 3) for side in range(len(joints))]
-        merged_rows = [row[np.isfinite(row).all(axis=1)] for row in merged_rows]
-        merged_rows = [row for row in merged_rows if len(row)]
-        if not merged_rows:
+def _rolling_extreme(values: np.ndarray, radius: int, maximum: bool) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    radius = max(0, int(radius))
+    padded = np.pad(values, (radius, radius), mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, 2 * radius + 1)
+    return windows.max(axis=1) if maximum else windows.min(axis=1)
+
+
+def _deadband_follow(values: np.ndarray, deadband: float) -> np.ndarray:
+    """Backlash follower: the output only moves once the input has left a ball
+    of radius `deadband` around it, and then only by the overshoot.
+
+    Jitter whose amplitude stays inside the band therefore produces exactly
+    zero output motion, while a sustained move is followed at the input's own
+    velocity, lagging by one band radius.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    out = np.empty_like(values)
+    if not len(values):
+        return out
+    current = values[0].copy()
+    for index, value in enumerate(values):
+        delta = value - current
+        distance = float(np.linalg.norm(delta))
+        if distance > deadband:
+            current = value - delta * (deadband / distance)
+        out[index] = current
+    return out
+
+
+def _slew_limit(values: np.ndarray, max_step: float) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    out = np.empty_like(values)
+    if not len(values):
+        return out
+    current = values[0].copy()
+    for index, value in enumerate(values):
+        delta = value - current
+        distance = float(np.linalg.norm(delta))
+        if distance > max_step:
+            delta *= max_step / distance
+        current = current + delta
+        out[index] = current
+    return out
+
+
+def _fill_invalid(values: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Hold the nearest valid sample across invalid frames (axis 0)."""
+    values = np.asarray(values, dtype=np.float64).copy()
+    valid = np.asarray(valid, dtype=bool)
+    if valid.all():
+        return values
+    if not valid.any():
+        return np.zeros_like(values)
+    indices = np.arange(len(values))
+    good = indices[valid]
+    nearest = good[np.clip(np.searchsorted(good, indices), 0, len(good) - 1)]
+    previous = good[np.clip(np.searchsorted(good, indices, side="right") - 1, 0, len(good) - 1)]
+    pick = np.where(np.abs(nearest - indices) <= np.abs(indices - previous), nearest, previous)
+    return values[pick]
+
+
+def _estimate_world_up(poses: np.ndarray, pose_valid: np.ndarray,
+                       world_up: np.ndarray | None = None) -> tuple[np.ndarray, dict[str, object]]:
+    """World-up (gravity) direction in the product world frame.
+
+    The product world is the first camera frame and carries no gravity. A
+    head-mounted camera keeps its right axis (+x) close to horizontal, so
+    world-up is the direction most orthogonal to every right axis in the clip:
+    the smallest-eigenvalue eigenvector of sum(r r^T). That is well-conditioned
+    only when the heading varies; with little yaw the two smallest eigenvalues
+    are close and the up vector is ambiguous within the plane perpendicular to
+    the mean right axis. The fallback then takes the camera's -down axis in
+    that plane and tilts it by the assumed head pitch so that the camera looks
+    forward-down at a work surface.
+    """
+    rotations = np.asarray(poses, dtype=np.float64)[np.asarray(pose_valid, dtype=bool)][:, :3, :3]
+    rotations = rotations[np.isfinite(rotations).all(axis=(1, 2))]
+    if not len(rotations):
+        rotations = np.eye(3, dtype=np.float64)[None]
+    rights = rotations[:, :, 0]
+    downs = rotations[:, :, 1]
+    forwards = rotations[:, :, 2]
+    mean_right = _normalize(rights.mean(axis=0), np.asarray([1.0, 0.0, 0.0]))
+    mean_down = _normalize(downs.mean(axis=0), np.asarray([0.0, 1.0, 0.0]))
+    mean_forward = _normalize(forwards.mean(axis=0), np.asarray([0.0, 0.0, 1.0]))
+    if world_up is not None:
+        up = _normalize(world_up, np.asarray([0.0, -1.0, 0.0]))
+        return up, {"branch": "given", "eigen_ratio": float("nan"), "eigenvalues": [float("nan")] * 3}
+
+    scatter = rights.T @ rights
+    eigenvalues, eigenvectors = np.linalg.eigh(scatter)
+    order = np.argsort(eigenvalues)
+    eigenvalues = eigenvalues[order]
+    eigenvectors = eigenvectors[:, order]
+    # The ratio floor is relative to the largest eigenvalue (~ frame count):
+    # a single pose or a perfectly rigid clip has two eigenvalues at round-off,
+    # and their quotient is noise, not conditioning.
+    smallest = max(float(eigenvalues[0]), 1e-4 * max(float(eigenvalues[2]), 1e-12))
+    ratio = float(eigenvalues[1]) / smallest
+    # lambda_1 / lambda_0 >= 4 means the second-smallest spread is at least twice
+    # the residual: the yaw variation has to exceed the roll noise before the
+    # eigenvector is trusted. When roll dominates instead, the right axes sweep
+    # around the camera forward and the eigenvector collapses onto that forward
+    # axis, i.e. a head pitch near 90 deg; a head camera at a work surface pitches
+    # 20-60 deg, so a candidate implying more than 75 deg is rejected too.
+    candidate = _normalize(eigenvectors[:, 0], -mean_down)
+    if float(np.dot(candidate, mean_down)) > 0.0:
+        candidate = -candidate
+    implied_pitch = math.degrees(math.asin(min(1.0, abs(float(np.dot(candidate, mean_forward))))))
+    if ratio >= 4.0 and implied_pitch <= 75.0:
+        up = candidate
+        branch = "eigen"
+    else:
+        base = -mean_down - mean_right * float(np.dot(-mean_down, mean_right))
+        base = _normalize(base, -mean_down)
+        pitch = math.radians(_FALLBACK_HEAD_PITCH_DEG)
+        candidates = []
+        for sign in (1.0, -1.0):
+            rotated = base * math.cos(sign * pitch) + np.cross(mean_right, base) * math.sin(sign * pitch) \
+                + mean_right * float(np.dot(mean_right, base)) * (1.0 - math.cos(sign * pitch))
+            candidates.append(_normalize(rotated, base))
+        # Forward-down: the camera forward has a negative component along up.
+        up = min(candidates, key=lambda candidate: float(np.dot(candidate, mean_forward)))
+        branch = "fallback"
+    return up, {"branch": branch, "eigen_ratio": ratio, "eigenvalues": [float(v) for v in eigenvalues]}
+
+
+def _horizontal_basis(up: np.ndarray, forward_hint: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Two horizontal unit axes (h1 along the hint's horizontal part, h2 = up x h1)."""
+    h1 = np.asarray(forward_hint, dtype=np.float64) - up * float(np.dot(forward_hint, up))
+    if float(np.linalg.norm(h1)) < 1e-6:
+        seed = np.asarray([1.0, 0.0, 0.0]) if abs(float(up[0])) < 0.9 else np.asarray([0.0, 0.0, 1.0])
+        h1 = seed - up * float(np.dot(seed, up))
+    h1 = _normalize(h1, np.asarray([0.0, 0.0, 1.0]))
+    h2 = _normalize(np.cross(up, h1), np.asarray([1.0, 0.0, 0.0]))
+    return h1, h2
+
+
+def _rotate_about(vector: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
+    axis = _normalize(axis, np.asarray([0.0, 0.0, 1.0]))
+    return (vector * math.cos(angle) + np.cross(axis, vector) * math.sin(angle)
+            + axis * float(np.dot(axis, vector)) * (1.0 - math.cos(angle)))
+
+
+def _floor_plane(points: np.ndarray, up: np.ndarray, forward_hint: np.ndarray) -> dict[str, np.ndarray]:
+    """Level floor: perpendicular to `up`, _FLOOR_DROP_M below the lowest scene point."""
+    h1, h2 = _horizontal_basis(up, forward_hint)
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    points = points[np.isfinite(points).all(axis=1)]
+    if not len(points):
+        points = np.zeros((1, 3), dtype=np.float64)
+    heights = points @ up
+    centre = np.median(points, axis=0)
+    origin = centre - up * float(np.dot(centre, up)) + up * (float(heights.min()) - _FLOOR_DROP_M)
+    return {"origin": origin, "h1": h1, "h2": h2, "up": np.asarray(up, dtype=np.float64)}
+
+
+def _follow_view_track(poses: np.ndarray, pose_valid: np.ndarray, joints: list[np.ndarray],
+                       cam_verts: np.ndarray, width: int, height: int, fps: float = 30.0,
+                       world_up: np.ndarray | None = None,
+                       margin: float = 0.06) -> tuple[list[dict[str, np.ndarray | float] | None], dict[str, object]]:
+    """One observer view per frame that follows the camera and hands slowly.
+
+    Everything is solved offline from the whole clip:
+    - world-up comes from _estimate_world_up and is the up hint of EVERY frame,
+      so the observer never rolls with the ego camera and the floor stays level;
+    - the look-at target is the camera-weighted centroid of camera centre and
+      hand joints, Gaussian-smoothed (sigma 1.5 s), passed through a 5 cm
+      backlash so jitter yields no motion, slew-limited and re-smoothed;
+    - the heading is the camera forward projected on the horizontal plane,
+      unwrapped, smoothed with sigma 3 s and a 15 deg backlash; the eye sits
+      behind that heading, _EYE_AZIMUTH to the side that keeps the hands in
+      their video-pane left/right order, _EYE_ELEVATION above horizontal;
+    - the standoff follows the smoothed scene extent within the fixed band and
+      the focal is only shortened (smoothly) when the scene would leave the
+      frame at the nominal field of view.
+    Returns per-frame views (None where the pose is invalid) and a report dict.
+    """
+    poses = np.asarray(poses, dtype=np.float64)
+    pose_valid = np.asarray(pose_valid, dtype=bool) & np.isfinite(poses).all(axis=(1, 2))
+    count = len(poses)
+    fps = float(fps) if np.isfinite(fps) and fps > 0 else 30.0
+    up, gravity = _estimate_world_up(poses, pose_valid, world_up)
+
+    centres = poses[:, :3, 3]
+    forwards = poses[:, :3, 2]
+    hand_means = np.full((count, len(joints), 3), np.nan, dtype=np.float64)
+    hand_valid = np.zeros((count, len(joints)), dtype=bool)
+    for side in range(len(joints)):
+        rows = np.asarray(joints[side], dtype=np.float64).reshape(count, -1, 3)
+        hand_valid[:, side] = np.isfinite(rows).all(axis=(1, 2))
+        hand_means[hand_valid[:, side], side] = rows[hand_valid[:, side]].mean(axis=1)
+
+    # Anchor: camera weight 2, each hand weight 1. A hand that drops out of
+    # the annotation keeps its last camera-relative offset instead of leaving
+    # the centroid, so visibility flicker cannot yank the observer.
+    anchor = np.zeros((count, 3), dtype=np.float64)
+    offsets = np.zeros((count, len(joints), 3), dtype=np.float64)
+    for side in range(len(joints)):
+        seen = hand_valid[:, side] & pose_valid
+        if not seen.any():
             continue
-        hand_depth = _camera_coordinates(np.vstack(merged_rows), np.asarray(poses[index], dtype=np.float64))[:, 2]
-        hand_depth = hand_depth[hand_depth > 1e-4]
-        if len(hand_depth):
-            depths.append(float(np.median(hand_depth)))
-    median_depth = float(np.median(depths)) if depths else 0.5
-    d = float(np.clip(2.6 * float(np.clip(0.66 * median_depth, 0.26, 0.44)), 0.62, 1.10))
-    eye = anchor - forward * (0.9 * d) - right * (0.5 * d) - down * (_EYE_ELEVATION * d)
-    target = np.asarray(scene, dtype=np.float64).mean(axis=0) if len(scene) else (anchor + forward * d)
-    basis = _look_at_view(eye, target, -down)
+        offsets[seen, side] = hand_means[seen, side] - centres[seen]
+        offsets[:, side] = _fill_invalid(offsets[:, side], seen)
+    hands_present = [side for side in range(len(joints)) if (hand_valid[:, side] & pose_valid).any()]
+    for index in range(count):
+        if not pose_valid[index]:
+            continue
+        weighted = [(2.0, centres[index])] + [(1.0, centres[index] + offsets[index, side]) for side in hands_present]
+        total = sum(weight for weight, _ in weighted)
+        anchor[index] = sum(weight * point for weight, point in weighted) / total
+    anchor = _fill_invalid(anchor, pose_valid)
+    target = _gaussian_smooth(anchor, 1.5 * fps)
+    target = _deadband_follow(target, _ANCHOR_DEADBAND_M)
+    target = _slew_limit(target, _OBSERVER_MAX_SPEED / fps)
+    target = _gaussian_smooth(target, 0.5 * fps)
 
-    view: dict[str, np.ndarray | float] = {
-        "eye": eye,
-        "right": basis["right"],
-        "up": basis["up"],
-        "forward": basis["forward"],
-        "focal": float(min(width, height)),
-        "cx": width * 0.5,
-        "cy": height * 0.54,
-    }
-    # Fit the whole clip, then centre on the fitted extent so the margin is
-    # symmetric instead of clipping whichever end of the traverse projected
-    # furthest from centre.
+    # Heading: horizontal camera forward, unwrapped, heavily smoothed.
+    h1, h2 = _horizontal_basis(up, _normalize(forwards[pose_valid].mean(axis=0) if pose_valid.any()
+                                              else np.asarray([0.0, 0.0, 1.0]), np.asarray([0.0, 0.0, 1.0])))
+    forward_filled = _fill_invalid(forwards, pose_valid)
+    heading = np.unwrap(np.arctan2(forward_filled @ h2, forward_filled @ h1))
+    heading = _gaussian_smooth(heading, 3.0 * fps)
+    heading = _deadband_follow(heading[:, None], math.radians(_HEADING_DEADBAND_DEG))[:, 0]
+    heading = _gaussian_smooth(heading, 0.5 * fps)
+
+    # Scene extent around the SMOOTHED target (the point the observer looks
+    # at), max over +-1.5 s, then smoothed. Measuring it around the raw anchor
+    # would ignore the lag of the target behind a walking camera, leaving the
+    # focal guard to zoom out hard instead of the standoff growing gently.
+    extent = np.zeros(count, dtype=np.float64)
+    scene_per_frame: list[np.ndarray] = []
+    for index in range(count):
+        chunk: list[np.ndarray] = []
+        if pose_valid[index]:
+            chunk.append((poses[index, :3, :3] @ cam_verts.T).T + centres[index])
+            for side in range(len(joints)):
+                if hand_valid[index, side]:
+                    chunk.append(np.asarray(joints[side][index], dtype=np.float64).reshape(-1, 3))
+        points = np.vstack(chunk) if chunk else np.zeros((0, 3), dtype=np.float64)
+        scene_per_frame.append(points)
+        if len(points):
+            extent[index] = float(np.linalg.norm(points - target[index], axis=1).max())
+    extent = _fill_invalid(extent, pose_valid)
+    extent = _rolling_extreme(extent, int(round(1.5 * fps)), maximum=True)
+    extent = _gaussian_smooth(extent, 1.0 * fps)
+    # Nominal field of view: focal = short side, so half the usable frame
+    # (minus margin) spans 0.5 - margin in normalised coordinates.
+    # The extent is a bounding radius; the scene is mostly elongated along the
+    # view axis (hands in front of the camera), so 0.75 of the sphere-fit
+    # distance frames it with room to spare. The focal guard below widens the
+    # field of view smoothly on the rare frames where that is too tight.
+    focal_nominal = float(min(width, height))
+    usable = 0.5 - margin
+    distance = np.clip(0.75 * extent / usable, *_EYE_DISTANCE_RANGE)
+    distance = _gaussian_smooth(distance, 1.0 * fps)
+
+    elevation = math.radians(_EYE_ELEVATION)
+
+    def eye_for(index: int, azimuth_sign: float) -> np.ndarray:
+        back = -(h1 * math.cos(heading[index]) + h2 * math.sin(heading[index]))
+        side_dir = _rotate_about(back, up, azimuth_sign * math.radians(_EYE_AZIMUTH))
+        return target[index] + distance[index] * (side_dir * math.cos(elevation) + up * math.sin(elevation))
+
+    def views_for(azimuth_sign: float) -> list[dict[str, np.ndarray | float] | None]:
+        result: list[dict[str, np.ndarray | float] | None] = []
+        for index in range(count):
+            if not pose_valid[index]:
+                result.append(None)
+                continue
+            eye = eye_for(index, azimuth_sign)
+            basis = _look_at_view(eye, target[index], up)
+            result.append({"eye": eye, "right": basis["right"], "up": basis["up"], "forward": basis["forward"],
+                           "focal": focal_nominal, "cx": width * 0.5, "cy": height * 0.54})
+        return result
+
+    # Side choice: the observer swings to whichever side keeps the anatomical
+    # left hand to the screen-left of the right hand by the widest margin, i.e.
+    # the hands neither mirror nor occlude each other. Camera-left (-x) is the
+    # established default and wins ties. One side for the whole clip.
+    def separation(views: list[dict[str, np.ndarray | float] | None]) -> float:
+        gaps: list[float] = []
+        for index in range(count):
+            view = views[index]
+            if view is None or len(joints) < 2 or not hand_valid[index].all():
+                continue
+            pixels, _, valid, _ = _project_view(hand_means[index], view, (width, height))
+            if valid.all():
+                gaps.append(float(pixels[1, 0] - pixels[0, 0]))
+        return float(np.mean(gaps)) if gaps else 0.0
+
+    candidates = {-1.0: views_for(-1.0), 1.0: views_for(1.0)}
+    scores = {sign: separation(views) for sign, views in candidates.items()}
+    side = -1.0 if scores[-1.0] >= scores[1.0] - 1e-9 else 1.0
+    views = candidates[side]
+
+    # Framing guard: if the nominal focal would clip the scene at some frame,
+    # shorten the focal there (rolling-min over +-1.5 s, then smoothed) so the
+    # widening is gradual rather than a zoom snap.
     px_margin = margin * min(width, height)
-    view["focal"] = _fit_focal(scene, view, width, height, px_margin, width * 0.5, height * 0.54)
-    extent = _frame_extent(scene, view)
-    if extent is not None:
-        x_min, x_max, y_min, y_max = extent
-        focal = float(view["focal"])
-        view["cx"] = float(width * 0.5 - focal * 0.5 * (x_min + x_max))
-        view["cy"] = float(height * 0.54 + focal * 0.5 * (y_min + y_max))
-    return view
+    required = np.full(count, focal_nominal, dtype=np.float64)
+    for index in range(count):
+        view = views[index]
+        if view is None or not len(scene_per_frame[index]):
+            continue
+        required[index] = min(focal_nominal, _fit_focal(scene_per_frame[index], view, width, height, px_margin,
+                                                       width * 0.5, height * 0.54))
+    required = _fill_invalid(required, pose_valid)
+    focal = _rolling_extreme(required, int(round(1.5 * fps)), maximum=False)
+    focal = _gaussian_smooth(focal, 0.5 * fps)
+    focal = np.minimum(focal, required)
+    for index in range(count):
+        if views[index] is not None:
+            views[index]["focal"] = float(focal[index])
+
+    scene_points = np.vstack([points for points in scene_per_frame if len(points)]) if any(
+        len(points) for points in scene_per_frame) else np.zeros((0, 3), dtype=np.float64)
+    report = {
+        "up": up,
+        "gravity": gravity,
+        "floor": _floor_plane(scene_points, up, h1),
+        "side": side,
+        "anchor": anchor,
+        "target": target,
+        "heading": heading,
+        "distance": distance,
+        "focal": focal,
+        "eye": np.asarray([view["eye"] if view is not None else np.full(3, np.nan) for view in views]),
+    }
+    return views, report
+
+
+def _single_pose_view(pose: np.ndarray, frame_joints: list[np.ndarray], cam_verts: np.ndarray,
+                      width: int, height: int) -> tuple[dict[str, np.ndarray | float], dict[str, object]]:
+    """Follow view for a one-frame clip (stills and tests)."""
+    joints = [np.asarray(hand, dtype=np.float64).reshape(1, -1, 3) for hand in frame_joints]
+    views, report = _follow_view_track(np.asarray(pose, dtype=np.float64)[None], np.asarray([True]),
+                                       joints, cam_verts, width, height)
+    return views[0], report
 
 
 def _spatial_background(width: int, height: int) -> np.ndarray:
@@ -662,21 +960,23 @@ def _spatial_background(width: int, height: int) -> np.ndarray:
     return np.rint((1.0 - y) * top + y * bottom).astype(np.uint8)
 
 
-def _draw_camera_grid(canvas: np.ndarray, pose: np.ndarray, joints: list[np.ndarray],
-                      view: dict[str, np.ndarray | float]) -> None:
-    """Rasterize render_rerun.py's fixed faint RDF ground grid.
+def _draw_floor_grid(canvas: np.ndarray, floor: dict[str, np.ndarray],
+                     view: dict[str, np.ndarray | float]) -> None:
+    """Rasterize the RRD-style faint ground grid on the level floor plane.
 
-    The v3 EgoDex coordinates in this result are already camera/world RDF: +Y
-    is down and +Z is camera-forward.  The RRD grid therefore stays on y=0.15
-    in world coordinates instead of being rebuilt from the current view basis.
+    The product world is the first camera frame, which is tilted by whatever
+    the head was doing at frame 1, so a grid on a world-axis plane leans. The
+    grid lives instead on the plane perpendicular to the estimated world-up,
+    _FLOOR_DROP_M below the lowest camera/hand point, with its lines aligned to
+    the clip's mean heading.
     """
-    del pose, joints
+    origin = np.asarray(floor["origin"], dtype=np.float64)
+    h1 = np.asarray(floor["h1"], dtype=np.float64)
+    h2 = np.asarray(floor["h2"], dtype=np.float64)
     grid_lines: list[np.ndarray] = []
-    grid_y = 0.15
-    for gx in np.arange(-2.0, 2.25, 0.5):
-        grid_lines.append(np.asarray(((gx, grid_y, -2.0), (gx, grid_y, 2.0)), dtype=np.float64))
-    for gz in np.arange(-2.0, 2.25, 0.5):
-        grid_lines.append(np.asarray(((-2.0, grid_y, gz), (2.0, grid_y, gz)), dtype=np.float64))
+    for offset in np.arange(-2.0, 2.25, 0.5):
+        grid_lines.append(np.asarray((origin + h1 * offset - h2 * 2.0, origin + h1 * offset + h2 * 2.0)))
+        grid_lines.append(np.asarray((origin + h2 * offset - h1 * 2.0, origin + h2 * offset + h1 * 2.0)))
     # The target view uses a crisp, one-pixel neutral grid; antialiasing keeps
     # diagonals smooth while retaining the sampled bright line core.
     alpha = 0.92
@@ -949,20 +1249,21 @@ def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, 
                   frame_joints: list[np.ndarray], meshes: list[np.ndarray | None], assets: HandSurfaceAssets | None,
                   frame_betas: list[np.ndarray] | None = None, intrinsic: np.ndarray | None = None,
                   source_size: tuple[int, int] | None = None,
-                  view: dict[str, np.ndarray | float] | None = None) -> np.ndarray:
+                  view: dict[str, np.ndarray | float] | None = None,
+                  floor: dict[str, np.ndarray] | None = None) -> np.ndarray:
     width, height = size
     canvas = _spatial_background(width, height)
     # Keep the reference cinema-camera proportions, but make the object small
     # enough to read as a spatial-view anchor rather than a dominant prop.
     cam_verts, cam_faces = _build_cinema_camera(s=0.085)
     cam_world = (np.asarray(pose[:3, :3], dtype=np.float64) @ cam_verts.T).T + pose[:3, 3]
-    if view is None:
-        # Single-frame callers (tests, stills) solve the static view from this
-        # one pose; the render loop passes the clip-wide view instead so nothing
-        # re-aims between frames.
-        view = _static_follow_view(np.asarray(pose, dtype=np.float64)[None], np.asarray([True]),
-                                   frame_joints, cam_verts, width, height)
-    _draw_camera_grid(canvas, pose, frame_joints, view)
+    if view is None or floor is None:
+        # Single-frame callers (tests, stills) solve the view from this one
+        # pose; the render loop passes the clip-wide smoothed track instead.
+        single_view, report = _single_pose_view(pose, frame_joints, cam_verts, width, height)
+        view = single_view if view is None else view
+        floor = report["floor"] if floor is None else floor
+    _draw_floor_grid(canvas, floor, view)
 
     skin_color = SKIN_COLOR
     for side in range(2):
@@ -1036,7 +1337,17 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=None, help="output height; defaults to source height")
     parser.add_argument("--start-frame", type=int, default=1, help="first 1-based frame to render")
     parser.add_argument("--max-frames", type=int, default=None, help="optional number of frames to render")
+    parser.add_argument("--world-up", type=str, default=None,
+                        help="optional gravity up vector 'x,y,z' in the result's world frame; estimated when omitted")
     args = parser.parse_args()
+    world_up = None
+    if args.world_up is not None:
+        try:
+            world_up = np.asarray([float(value) for value in args.world_up.split(",")], dtype=np.float64)
+        except ValueError:
+            raise SystemExit("--world-up must be three comma-separated numbers")
+        if world_up.shape != (3,) or not np.isfinite(world_up).all() or np.linalg.norm(world_up) < 1e-9:
+            raise SystemExit("--world-up must be a finite non-zero 'x,y,z' vector")
 
     document, intrinsic, poses, joints, joints_px, betas, pose_valid = _load_document(args.annotation_json, args.camera)
     frame_count = int(document["Metadata"]["帧数"])
@@ -1085,11 +1396,15 @@ def main() -> int:
         raise SystemExit(f"cannot open writer: {args.output}")
 
     centers = np.where(pose_valid[:, None], poses[:, :3, 3], np.nan)
-    # One fixed observer for the whole clip: solved from every valid camera pose
-    # and every hand joint in the annotation, so the pane never re-aims, zooms or
-    # drifts between frames. Computed outside the loop on purpose.
+    # The observer track is solved offline from every valid camera pose and
+    # every hand joint, so per-frame rendering only looks its view up.
     world_cam_verts, _ = _build_cinema_camera(s=0.085)
-    static_view = _static_follow_view(poses, pose_valid, joints, world_cam_verts, pane_width, pane_height)
+    views, track = _follow_view_track(poses, pose_valid, joints, world_cam_verts, pane_width, pane_height,
+                                      fps=fps, world_up=world_up)
+    gravity = track["gravity"]
+    print("world-up: branch={} eigen_ratio={:.2f} up=[{:.4f}, {:.4f}, {:.4f}] observer_side={}".format(
+        gravity["branch"], float(gravity["eigen_ratio"]), *[float(v) for v in track["up"]],
+        "camera-left" if track["side"] < 0 else "camera-right"))
     cursor = 0
     while cursor < len(subtitles) and int(subtitles[cursor]["起始帧"][1]) < start + 1:
         cursor += 1
@@ -1116,7 +1431,8 @@ def main() -> int:
             if pose_valid[frame_index]:
                 world = _render_world((pane_width, pane_height), poses[frame_index], centers, frame_index, frame_joints, meshes, assets,
                                       [betas[0][frame_index], betas[1][frame_index]], intrinsic,
-                                      (source_width, source_height), view=static_view)
+                                      (source_width, source_height), view=views[frame_index],
+                                      floor=track["floor"])
                 for side, side_name in ((0, "left"), (1, "right")):
                     if meshes[side] is not None:
                         world_mesh_faces += len(assets.faces(side_name))
@@ -1132,7 +1448,7 @@ def main() -> int:
             canvas[:pane_height, pane_width:pane_width * 2] = world
             title_size = max(30, int(round(pane_height * 0.043)))
             left_title = "Hand joints overlay"
-            right_title = "Camera and hands: fixed side-rear view"
+            right_title = "Camera and hands: side-rear follow view"
             _put_text_mixed(canvas, left_title, (24, 64), title_size, (255, 255, 255), 2)
             _put_text_mixed(canvas, right_title, (pane_width + 24, 64), title_size, (255, 255, 255), 2)
             _draw_subtitle(canvas, structured, narrative, frame_index, frame_count, band_height)

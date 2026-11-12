@@ -587,40 +587,31 @@ class DagResultTests(unittest.TestCase):
             pose = np.eye(4, dtype=float)
             pose[:3, 3] = [translation, 0.0, 0.0]
             cam_verts, _ = renderer._build_cinema_camera(s=0.085)
-            view = renderer._static_follow_view(np.asarray([pose]), np.asarray([True]),
-                                                [hand + pose[:3, 3], hand + pose[:3, 3]],
-                                                cam_verts, 640, 400)
+            view, report = renderer._single_pose_view(pose, [hand + pose[:3, 3], hand + pose[:3, 3]],
+                                                      cam_verts, 640, 400)
             marker, _ = renderer._camera_marker_points(pose)
             points = np.vstack((marker, hand + pose[:3, 3], hand + pose[:3, 3]))
             pixels, _, valid, _ = renderer._project_view(points, view, (640, 400))
             self.assertTrue(valid.all(), "camera and both hands must be in front of the view")
             self.assertTrue(np.all((pixels[:, 0] >= 0) & (pixels[:, 0] < 640)))
             self.assertTrue(np.all((pixels[:, 1] >= 0) & (pixels[:, 1] < 400)))
-            # Three-quarter rear view: the observer stands behind the camera
-            # (dominant negative forward offset), off to one side and above.
-            off = view["eye"] - pose[:3, 3]
-            rear = float(np.dot(off, pose[:3, 2]))
-            lateral = float(np.dot(off, pose[:3, 0]))
-            vertical = float(np.dot(off, pose[:3, 1]))
-            self.assertLess(rear, 0.0, "observer must sit behind the camera")
-            self.assertGreater(abs(lateral), 0.0)
-            self.assertLess(vertical, 0.0, "down_cam is +y, so a negative offset is above")
-            self.assertGreater(abs(rear), abs(lateral))
-            self.assertGreater(abs(rear), abs(vertical))
-            # Eye placement follows the spec ratios against the adaptive distance.
-            # `pose` is the only pose in the clip, so the clip-median anchor is
-            # this camera centre and the ratios hold exactly.
-            self.assertAlmostEqual(abs(lateral / rear), 0.5 / 0.9, places=6)
-            self.assertAlmostEqual(abs(vertical / rear), renderer._EYE_ELEVATION / 0.9, places=6)
-            # Elevation above the anchor's horizontal plane is the one knob the
-            # "look down slightly more" request turned. It is measured against
-            # the full horizontal offset (forward AND lateral), not forward
-            # alone: atan2(vertical, hypot(rear, lateral)) = 33.0 deg, up from
-            # 25.9 deg with the old 0.5 vertical factor.
-            elevation = np.degrees(np.arctan2(abs(vertical), np.hypot(abs(rear), abs(lateral))))
-            self.assertGreater(elevation, 31.5)
-            self.assertLess(elevation, 34.5)
-            self.assertAlmostEqual(elevation, 33.05, places=1)
+            # Side-above-behind: measured against the estimated world-up and
+            # the camera's horizontal heading, not against the camera axes.
+            up = report["up"]
+            heading = pose[:3, 2] - up * float(np.dot(pose[:3, 2], up))
+            heading /= np.linalg.norm(heading)
+            off = view["eye"] - report["target"][0]
+            rear = float(np.dot(off, heading))
+            vertical = float(np.dot(off, up))
+            lateral = float(np.linalg.norm(off - heading * rear - up * vertical))
+            self.assertLess(rear, 0.0, "observer must sit behind the heading")
+            self.assertGreater(vertical, 0.0, "observer must sit above the anchor")
+            self.assertGreater(lateral, 0.0)
+            self.assertAlmostEqual(np.degrees(np.arctan2(lateral, abs(rear))), renderer._EYE_AZIMUTH, places=6)
+            elevation = np.degrees(np.arctan2(vertical, np.hypot(rear, lateral)))
+            self.assertAlmostEqual(elevation, renderer._EYE_ELEVATION, places=6)
+            self.assertGreater(elevation, 30.0)
+            self.assertLess(elevation, 35.0)
 
     def test_view_basis_is_a_rigid_look_at_frame(self):
         import numpy as np
@@ -629,8 +620,7 @@ class DagResultTests(unittest.TestCase):
         pose = np.eye(4, dtype=float)
         pose[:3, 3] = [0.12, -0.05, 0.02]
         cam_verts, _ = renderer._build_cinema_camera(s=0.085)
-        view = renderer._static_follow_view(np.asarray([pose]), np.asarray([True]), [hand + pose[:3, 3]],
-                                            cam_verts, 640, 400)
+        view, report = renderer._single_pose_view(pose, [hand + pose[:3, 3]], cam_verts, 640, 400)
         basis = np.stack([view["right"], view["up"], view["forward"]])
         np.testing.assert_allclose(basis @ basis.T, np.eye(3), atol=1e-9, err_msg="basis must be orthonormal")
         # The renderer projects like a pinhole camera (pixel-y is flipped), so the
@@ -639,34 +629,31 @@ class DagResultTests(unittest.TestCase):
         # that convention, which is why the orthonormality check above (not det)
         # is what proves the view is a rotation, not a shear.
         np.testing.assert_allclose(np.cross(view["forward"], view["up"]), view["right"], atol=1e-9)
-        # The look direction must point from the eye at the hands, not along a
-        # permuted copy of the camera axes.
-        target = (hand + pose[:3, 3]).mean(axis=0)
-        direction = renderer._normalize(target - view["eye"], np.zeros(3))
-        self.assertGreater(float(np.dot(direction, view["forward"])), 0.9)
-        # Up hint is the camera's own -down axis, projected perpendicular to the
-        # view direction, so the dot with -down is cos(pitch) rather than ~1:
-        # the 33 deg elevation tilts `up` off world-vertical by that same angle.
-        # Note the oblique 3/4 view legitimately gives `up` a nonzero camera-x
-        # component, so that is NOT a roll test.
-        self.assertLess(float(np.dot(view["up"], pose[:3, 1])), -0.80)
-        # +y is world-down in this RDF scene, so a downward-looking view has a
-        # POSITIVE forward.y; that is the pitch magnitude to assert on.
-        pitch = np.degrees(np.arcsin(np.clip(float(view["forward"][1]), -1.0, 1.0)))
-        np.testing.assert_allclose(float(np.dot(view["up"], pose[:3, 1])), -np.cos(np.radians(pitch)), atol=1e-9)
-        self.assertGreater(pitch, 20.0)
-        self.assertLess(pitch, 45.0)
-        self.assertGreater(float(view["forward"][1]), 0.0, "observer must look downward")
-        # The property a viewer would call "the horizon is level": world-down
-        # projects to screen-vertical. Measured on the rendered scene, not on
-        # the basis vectors, because perspective is what can tilt the floor.
-        centre = pose[:3, 3]
-        probe = np.vstack((centre, centre + np.asarray([0.0, 1.0, 0.0])))
+        # The look direction points from the eye at the smoothed anchor.
+        direction = renderer._normalize(report["target"][0] - view["eye"], np.zeros(3))
+        self.assertGreater(float(np.dot(direction, view["forward"])), 0.999)
+        # Zero roll: the view up lies in the vertical plane spanned by world-up
+        # and the view direction, i.e. its component along `right` vanishes.
+        up = report["up"]
+        self.assertAlmostEqual(float(np.dot(up, view["right"])), 0.0, places=9)
+        self.assertGreater(float(np.dot(view["up"], up)), 0.8)
+        # A single frame cannot pin world-up from yaw variation, so the fallback
+        # tilts the camera's -down by the assumed head pitch.
+        self.assertEqual(report["gravity"]["branch"], "fallback")
+        pitch = np.degrees(np.arcsin(np.clip(-float(np.dot(pose[:3, 2], up)), -1.0, 1.0)))
+        self.assertAlmostEqual(pitch, renderer._FALLBACK_HEAD_PITCH_DEG, places=6)
+        # The observer looks downward (forward has a negative world-up component).
+        self.assertLess(float(np.dot(view["forward"], up)), 0.0)
+        # "The horizon is level": a vertical line through the look-at target
+        # (on the optical axis, where perspective convergence vanishes) projects
+        # exactly to screen-vertical.
+        target = report["target"][0]
+        probe = np.vstack((target - 0.1 * up, target + 0.1 * up))
         pixels, _, valid, _ = renderer._project_view(probe, view, (640, 400))
         self.assertTrue(valid.all())
         delta = pixels[1] - pixels[0]
         roll = np.degrees(np.arctan2(delta[0], abs(delta[1])))
-        self.assertLess(abs(roll), 2.0, "camera roll: world-down must stay screen-vertical")
+        self.assertLess(abs(roll), 1e-6, "world-up must stay screen-vertical")
 
     def test_world_pane_keeps_the_video_pane_left_right_order(self):
         import numpy as np
@@ -680,8 +667,7 @@ class DagResultTests(unittest.TestCase):
         right = np.array([[0.16, 0.13, 0.60]] * 21, dtype=float)
         intrinsic = np.asarray(self.document["Metadata"]["相机内参"], dtype=float)
         cam_verts, _ = renderer._build_cinema_camera(s=0.085)
-        view = renderer._static_follow_view(np.asarray([pose]), np.asarray([True]),
-                                            [left + pose[:3, 3], right + pose[:3, 3]], cam_verts, 640, 400)
+        view, _ = renderer._single_pose_view(pose, [left + pose[:3, 3], right + pose[:3, 3]], cam_verts, 640, 400)
         pixels, _, valid, _ = renderer._project_view(
             np.vstack((left + pose[:3, 3], right + pose[:3, 3])), view, (640, 400))
         self.assertTrue(valid.all())
@@ -718,9 +704,9 @@ class DagResultTests(unittest.TestCase):
         # The view must not distort that agreement: the camera-relative lateral
         # ordering of every joint pair survives the world projection.
         cam_verts, _ = renderer._build_cinema_camera(s=0.085)
-        view = renderer._static_follow_view(
-            np.asarray([pose]), np.asarray([True]),
-            [np.asarray(self.document["逐帧轨迹"][0]["帧1"]["手0"]["手部21点坐标"], dtype=float)], cam_verts, 640, 400)
+        view, _ = renderer._single_pose_view(
+            pose, [np.asarray(self.document["逐帧轨迹"][0]["帧1"]["手0"]["手部21点坐标"], dtype=float)],
+            cam_verts, 640, 400)
         self.assertAlmostEqual(float(np.linalg.norm(view["forward"])), 1.0, places=9)
 
     def test_spatial_scene_contains_small_camera_rgb_axes_and_full_trail(self):
@@ -789,7 +775,183 @@ class DagResultTests(unittest.TestCase):
         gaps = np.asarray([[0.0, 0.0, 0.0], [np.nan, np.nan, np.nan], [0.002, 0.0, 0.004]], dtype=float)
         np.testing.assert_array_equal(renderer._trajectory_upto(gaps, 2), np.asarray([[0.0, 0.0, 0.0], [0.002, 0.0, 0.004]]))
 
-    def test_observer_view_is_fixed_for_the_whole_clip_with_a_pixel_margin(self):
+    @staticmethod
+    def synthetic_clip(count, yaw, pitch, roll, centres, true_up):
+        """Camera poses (x right, y down, z forward) and two hands from Euler tracks.
+
+        `true_up` is the gravity direction the clip is built around; the
+        renderer never sees it unless a test passes it in explicitly.
+        """
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        true_up = np.asarray(true_up, dtype=float) / np.linalg.norm(true_up)
+        seed = np.array([0.0, 0.0, 1.0]) if abs(true_up[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        forward0 = seed - true_up * float(np.dot(seed, true_up))
+        forward0 /= np.linalg.norm(forward0)
+        poses = np.zeros((count, 4, 4), dtype=float)
+        hands = [np.zeros((count, 21, 3), dtype=float) for _ in range(2)]
+        offsets = (np.array([-0.10, 0.15, 0.45]), np.array([0.10, 0.15, 0.45]))
+        for index in range(count):
+            forward = renderer._rotate_about(forward0, true_up, float(yaw[index]))
+            right = np.cross(forward, true_up)
+            right /= np.linalg.norm(right)
+            # pitch: nose down about the right axis; roll: about the forward axis.
+            forward = renderer._rotate_about(forward, right, -float(pitch[index]))
+            down = np.cross(forward, right)
+            right = renderer._rotate_about(right, forward, float(roll[index]))
+            down = renderer._rotate_about(down, forward, float(roll[index]))
+            rotation = np.column_stack((right, down, forward))
+            poses[index, :3, :3] = rotation
+            poses[index, :3, 3] = centres[index]
+            poses[index, 3, 3] = 1.0
+            for side in range(2):
+                base = rotation @ offsets[side] + centres[index]
+                hands[side][index] = base + np.arange(21)[:, None] * np.array([0.002, 0.001, 0.0])
+        return poses, hands
+
+    def track_metrics(self, poses, hands, world_up=None, fps=30.0):
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        cam_verts, _ = renderer._build_cinema_camera(s=0.085)
+        views, report = renderer._follow_view_track(poses, np.ones(len(poses), dtype=bool), hands, cam_verts,
+                                                    640, 400, fps=fps, world_up=world_up)
+        up = report["up"]
+        roll = []
+        up_angle = []
+        margins = []
+        for index, view in enumerate(views):
+            self.assertIsNotNone(view)
+            # Roll is the component of world-up along screen-right: zero means
+            # the view up and world-up share a vertical plane.
+            roll.append(np.degrees(np.arcsin(np.clip(float(np.dot(up, view["right"])), -1.0, 1.0))))
+            # View up equals world-up projected perpendicular to the view axis.
+            projected = up - view["forward"] * float(np.dot(up, view["forward"]))
+            projected /= np.linalg.norm(projected)
+            up_angle.append(np.degrees(np.arccos(np.clip(float(np.dot(projected, view["up"])), -1.0, 1.0))))
+            body = (poses[index, :3, :3] @ cam_verts.T).T + poses[index, :3, 3]
+            pixels, _, valid, _ = renderer._project_view(np.vstack((body, hands[0][index], hands[1][index])),
+                                                         view, (640, 400))
+            self.assertTrue(valid.all())
+            margins.append(min(pixels[:, 0].min(), pixels[:, 1].min(),
+                               639 - pixels[:, 0].max(), 399 - pixels[:, 1].max()))
+        eye = report["eye"]
+        steps = np.linalg.norm(np.diff(eye, axis=0), axis=1)
+        speed = steps * fps
+        accel = np.abs(np.diff(speed)) * fps if len(speed) > 1 else np.zeros(1)
+        return {"views": views, "report": report, "up": up, "roll": np.asarray(roll),
+                "up_angle": np.asarray(up_angle), "margin": float(min(margins)),
+                "eye_path": float(steps.sum()), "max_speed": float(speed.max()), "max_accel": float(accel.max())}
+
+    def test_observer_up_is_world_up_under_camera_roll(self):
+        import numpy as np
+        count = 120
+        t = np.linspace(0.0, 1.0, count)
+        true_up = np.array([0.0, -1.0, 0.0])
+        poses, hands = self.synthetic_clip(
+            count, yaw=np.radians(15.0) * np.sin(2.0 * np.pi * t), pitch=np.full(count, np.radians(20.0)),
+            roll=np.radians(30.0) * np.sin(3.0 * np.pi * t),
+            centres=np.outer(t, [0.5, 0.0, 0.3]), true_up=true_up)
+        for world_up in (None, true_up):
+            with self.subTest(world_up="estimated" if world_up is None else "given"):
+                metrics = self.track_metrics(poses, hands, world_up=world_up)
+                # The observer's up is the estimated world-up on every frame.
+                self.assertLess(float(metrics["up_angle"].max()), 0.5)
+                self.assertLess(float(np.abs(metrics["roll"]).max()), 1e-6)
+                self.assertGreater(metrics["margin"], 0.0)
+                estimate_error = np.degrees(np.arccos(np.clip(float(np.dot(metrics["up"], true_up)), -1.0, 1.0)))
+                if world_up is None:
+                    # Heavy roll breaks the "right axis is horizontal" premise of
+                    # the eigen estimate; the estimator must notice and fall back
+                    # to the pitch-tilted camera down axis, which stays near truth.
+                    self.assertEqual(metrics["report"]["gravity"]["branch"], "fallback")
+                    self.assertLess(estimate_error, 10.0)
+                else:
+                    self.assertLess(estimate_error, 1e-9)
+        # The camera really did roll: its right axis left the horizontal by ~30 deg.
+        tilt = np.degrees(np.arcsin(np.abs(poses[:, :3, 0] @ true_up)))
+        self.assertGreater(float(tilt.max()), 28.0)
+
+    def test_jitter_produces_no_observer_motion(self):
+        import numpy as np
+        count = 90
+        rng = np.random.default_rng(7)
+        poses, hands = self.synthetic_clip(
+            count, yaw=np.radians(rng.uniform(-2.0, 2.0, count)), pitch=np.radians(20.0 + rng.uniform(-2.0, 2.0, count)),
+            roll=np.radians(rng.uniform(-2.0, 2.0, count)), centres=rng.uniform(-0.01, 0.01, (count, 3)),
+            true_up=[0.0, -1.0, 0.0])
+        metrics = self.track_metrics(poses, hands)
+        self.assertLessEqual(metrics["eye_path"], 0.005, "jitter must not move the observer")
+        self.assertLess(float(np.abs(metrics["roll"]).max()), 1e-6)
+        self.assertGreater(metrics["margin"], 0.0)
+
+    def test_walk_and_turn_is_followed(self):
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        fps = 30.0
+        count = int(10 * fps)
+        t = np.linspace(0.0, 10.0, count)
+        true_up = np.array([0.0, -1.0, 0.0])
+        walk = np.clip(t / 3.0, 0.0, 1.0)                  # 0-3 s: walk 2 m forward
+        turn = np.clip((t - 3.0) / 3.0, 0.0, 1.0)          # 3-6 s: turn 90 deg, then hold
+        yaw = np.radians(90.0) * turn
+        poses, hands = self.synthetic_clip(count, yaw=yaw, pitch=np.full(count, np.radians(20.0)),
+                                           roll=np.zeros(count), centres=np.outer(walk, [0.0, 0.0, 2.0]),
+                                           true_up=true_up)
+        metrics = self.track_metrics(poses, hands, fps=fps)
+        self.assertEqual(metrics["report"]["gravity"]["branch"], "eigen")
+        self.assertLess(np.degrees(np.arccos(float(np.dot(metrics["up"], true_up)))), 1.0)
+        # Followed: the observer travelled with the walk, within the speed and
+        # acceleration bounds and without any roll.
+        self.assertGreater(metrics["eye_path"], 1.0)
+        self.assertLessEqual(metrics["max_speed"], renderer._OBSERVER_MAX_SPEED + 1e-6)
+        self.assertLess(metrics["max_accel"], 3.0)
+        self.assertLess(float(np.abs(metrics["roll"]).max()), 1e-6)
+        self.assertGreater(metrics["margin"], 0.0)
+        # Ends behind the new heading: the eye's horizontal offset from the
+        # target opposes the final camera forward, and the smoothed heading has
+        # swung through more than half of the 90 deg turn.
+        final = metrics["views"][-1]
+        target = metrics["report"]["target"][-1]
+        offset = final["eye"] - target
+        horizontal = offset - true_up * float(np.dot(offset, true_up))
+        final_forward = poses[-1, :3, 2] - true_up * float(np.dot(poses[-1, :3, 2], true_up))
+        self.assertLess(float(np.dot(horizontal, final_forward)), 0.0)
+        heading = metrics["report"]["heading"]
+        self.assertGreater(float(np.degrees(heading[-1] - heading[0])), 45.0)
+        # Smooth: no per-frame reversals in the heading track.
+        self.assertTrue(np.all(np.diff(heading) >= -1e-9))
+
+    def test_floor_is_level_and_below_the_scene(self):
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        count = 60
+        t = np.linspace(0.0, 1.0, count)
+        true_up = np.array([0.0, -1.0, 0.0])
+        poses, hands = self.synthetic_clip(count, yaw=np.radians(20.0) * np.sin(2.0 * np.pi * t),
+                                           pitch=np.full(count, np.radians(25.0)), roll=np.zeros(count),
+                                           centres=np.outer(t, [0.2, 0.0, 0.2]), true_up=true_up)
+        metrics = self.track_metrics(poses, hands)
+        floor = metrics["report"]["floor"]
+        up = metrics["up"]
+        np.testing.assert_allclose(floor["up"], up)
+        self.assertAlmostEqual(float(np.dot(floor["h1"], up)), 0.0, places=9)
+        self.assertAlmostEqual(float(np.dot(floor["h2"], up)), 0.0, places=9)
+        self.assertAlmostEqual(float(np.dot(floor["h1"], floor["h2"])), 0.0, places=9)
+        lowest = min(float((poses[:, :3, 3] @ up).min()), float((hands[0].reshape(-1, 3) @ up).min()),
+                     float((hands[1].reshape(-1, 3) @ up).min()))
+        self.assertLess(float(np.dot(floor["origin"], up)), lowest)
+        self.assertAlmostEqual(float(np.dot(floor["origin"], up)), lowest - renderer._FLOOR_DROP_M, places=2)
+        # Rendering with the track draws the grid without error and keeps the
+        # established dark blue-green style.
+        view = metrics["views"][count // 2]
+        world = renderer._render_world((640, 400), poses[count // 2], poses[:, :3, 3], count // 2,
+                                       [hands[0][count // 2], hands[1][count // 2]], [None, None], None,
+                                       [np.full(10, np.nan), np.full(10, np.nan)], None, (640, 480),
+                                       view=view, floor=floor)
+        self.assertEqual(world.shape, (400, 640, 3))
+        self.assertGreater(int((np.abs(world.astype(int) - np.asarray(renderer.GRID_COLOR)).max(axis=2) < 25).sum()), 200)
+
+    def test_follow_track_keeps_the_fixture_scene_in_frame(self):
         import numpy as np
         renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
         frames = self.document["逐帧轨迹"]
@@ -803,21 +965,14 @@ class DagResultTests(unittest.TestCase):
         pose_valid = np.isfinite(poses).all(axis=(1, 2))
         cam_verts, _ = renderer._build_cinema_camera(s=0.085)
         width, height = 640, 400
-        view = renderer._static_follow_view(poses, pose_valid, joints, cam_verts, width, height)
-
-        # ONE view object, reused for every frame: nothing re-aims or zooms, so
-        # the eye, basis and focal must be byte-identical across the clip.
-        for frame_index in range(len(frames)):
-            again = renderer._static_follow_view(poses, pose_valid, joints, cam_verts, width, height)
-            np.testing.assert_array_equal(again["eye"], view["eye"])
-            np.testing.assert_array_equal(again["right"], view["right"])
-            self.assertEqual(again["focal"], view["focal"])
-            self.assertEqual(again["cx"], view["cx"])
-            self.assertEqual(again["cy"], view["cy"])
-
-        # Numerical acceptance: the camera body and every hand joint of every
-        # frame land inside the pane with a real margin, and the reported
-        # worst case is the spec's 6% of the pane's short side.
+        views, report = renderer._follow_view_track(poses, pose_valid, joints, cam_verts, width, height, fps=15.0)
+        self.assertEqual(len(views), len(frames))
+        self.assertIn(report["gravity"]["branch"], ("eigen", "fallback"))
+        # The same input yields the same track: nothing is random or stateful.
+        again, _ = renderer._follow_view_track(poses, pose_valid, joints, cam_verts, width, height, fps=15.0)
+        for first, second in zip(views, again):
+            np.testing.assert_array_equal(first["eye"], second["eye"])
+            self.assertEqual(first["focal"], second["focal"])
         worst = None
         for frame_index in np.flatnonzero(pose_valid):
             pose = poses[frame_index]
@@ -827,18 +982,17 @@ class DagResultTests(unittest.TestCase):
                 row = joints[side][frame_index]
                 if np.isfinite(row).all():
                     chunk.append(row)
-            pixels, _, valid, _ = renderer._project_view(np.vstack(chunk), view, (width, height))
-            self.assertTrue(valid.all(), "scene must sit in front of the fixed eye")
+            pixels, _, valid, _ = renderer._project_view(np.vstack(chunk), views[frame_index], (width, height))
+            self.assertTrue(valid.all(), "scene must sit in front of the eye")
             margin = min(pixels[:, 0].min(), pixels[:, 1].min(),
                          (width - 1) - pixels[:, 0].max(), (height - 1) - pixels[:, 1].max())
             worst = margin if worst is None else min(worst, margin)
-        self.assertGreater(worst, 0.0, "scene must not be clipped at any frame")
         self.assertGreater(worst, 0.04 * min(width, height), "worst-case margin {:.1f}px".format(worst))
 
     def test_render_labels_are_english(self):
         source = Path(importlib.import_module("ego_anno.rendering.render_ego_json_overlay").__file__).read_text(encoding="utf-8")
         self.assertIn("Hand joints overlay", source)
-        self.assertIn("Camera and hands: fixed side-rear view", source)
+        self.assertIn("Camera and hands: side-rear follow view", source)
         self.assertNotIn("fixed side-rear view: camera and hands", source)
         self.assertNotIn("left hand: ", source)
         self.assertNotIn("right hand: ", source)
