@@ -7,7 +7,7 @@
     {
       "source_path": "clusters/py312/render/src/render_pack/render_ego_json_overlay.py",
       "vendored_path": "render_ego_json_overlay.py",
-      "sha256": "2dbbb96bc21f56fa6eb2f7e525446d96a6dd7a33e3a8153de45e604879f699fc"
+      "sha256": "c7f2e6166f6cc91748f1747b41f4222bb45c63b92390b575955c1e0c2928a603"
     },
     {
       "source_path": "clusters/py312/render/src/render_pack/cosmos_e2e.py",
@@ -17,7 +17,7 @@
     {
       "source_path": "clusters/py312/render/src/render_pack/body_pane.py",
       "vendored_path": "body_pane.py",
-      "sha256": "4f6e0cbe9f69ff6eabdad9a390015cfc99494a06f2d6dafa7b02138aa19c3839"
+      "sha256": "906112b4e1c106b000b9a7e9dd675e67ae41e97173e5b1f2edbae00cce830120"
     }
   ]
 }

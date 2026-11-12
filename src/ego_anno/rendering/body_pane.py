@@ -21,7 +21,7 @@ front-oblique camera solved once for the whole clip. numpy + OpenCV only.
 
 Coordinates: the *product world* is the result's world frame (first camera frame).
 The *display world* is right-handed with z = world-up, y = the clip's mean horizontal
-gaze and the median head height at z = HEAD_HEIGHT_M (an assumed EgoDex median; the
+gaze and the median head height at z = HEAD_HEIGHT_M (an assumed typical value; the
 result carries no floor), lowered when the clip's highest head would otherwise exceed
 the rig's standing eye height, so the grid's Z labels are nominal heights.
 """
@@ -47,7 +47,7 @@ SPINE = (0.11, 0.13, 0.13, 0.13)      # pelvis -> shoulder centre segments, lumb
 LEAN_MAX = math.radians(15.0)         # thoracic lean cap
 NECK_MAX = math.radians(45.0)         # lower-cervical flexion cap
 REACH = 0.9995 * ARM                  # farther than this the arm is drawn straight
-HEAD_HEIGHT_M = 1.12                  # EgoDex median head height (display z of the median head)
+HEAD_HEIGHT_M = 1.12                  # typical seated head height (display z of the median head)
 STANDING_EYE_M = 0.936 * STATURE_M    # no head is drawn higher than the rig's standing eye
 REFERENCE_FPS = 30.0                  # smoothing sigmas below are in frames at this rate
 

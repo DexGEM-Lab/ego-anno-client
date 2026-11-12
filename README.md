@@ -22,7 +22,7 @@ From a fresh directory, run:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install "ego-anno-client[render] @ https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.6.0/ego_anno_client-0.6.0-py3-none-any.whl"
+.venv/bin/python -m pip install "ego-anno-client[render] @ https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.6.1/ego_anno_client-0.6.1-py3-none-any.whl"
 
 # Set EGO_ANNO_API_KEY privately in the environment before running the client.
 .venv/bin/ego-anno submit --pipeline e2e --video ./clip.mp4 \
@@ -81,22 +81,22 @@ The e2e billing ratio (default 0.1) is a deployment setting.
 ## 1. Download and install the client
 
 Install Python 3.8+ with pip, preferably in a virtual environment. Get the
-released client from the public [v0.6.0 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.6.0).
+released client from the public [v0.6.1 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.6.1).
 Install its wheel directly (no Git checkout required):
 
 ```bash
-python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.6.0/ego_anno_client-0.6.0-py3-none-any.whl"
+python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.6.1/ego_anno_client-0.6.1-py3-none-any.whl"
 ego-anno --help
 ```
 
-Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.6.0/ego_anno_client-0.6.0-py3-none-any.whl)
+Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.6.1/ego_anno_client-0.6.1-py3-none-any.whl)
 from that Release and install the local file:
 
 ```bash
-python3 -m pip install ./ego_anno_client-0.6.0-py3-none-any.whl
+python3 -m pip install ./ego_anno_client-0.6.1-py3-none-any.whl
 ```
 
-The v0.6.0 wheel renders a three-pane 1920x1080 MP4 by default: the video with hand overlay, a gravity-level side-rear follow view of the camera and hands (smoothed offline: no jitter, no roll, level floor grid, camera trail), and an upper-body skeleton whose head is the camera and whose wrists are the annotated hands. `--layout two-pane` keeps the previous layout, `--world-up X,Y,Z` overrides the estimated gravity, and `--mano-dir` now also draws MANO surfaces for Cosmos e2e results (one hand shape per side fitted to the predicted bone lengths). It keeps every v0.5.0 capability.
+The v0.6.1 wheel (0.6.0 plus a fix so `--mano-dir` needs no scipy) renders a three-pane 1920x1080 MP4 by default: the video with hand overlay, a gravity-level side-rear follow view of the camera and hands (smoothed offline: no jitter, no roll, level floor grid, camera trail), and an upper-body skeleton whose head is the camera and whose wrists are the annotated hands. `--layout two-pane` keeps the previous layout, `--world-up X,Y,Z` overrides the estimated gravity, and `--mano-dir` now also draws MANO surfaces for Cosmos e2e results (one hand shape per side fitted to the predicted bone lengths). It keeps every v0.5.0 capability.
 
 The v0.5.0 wheel admits 31–9001 frame e2e clips and renders the hand+head
 `cosmos-e2e-result/v2` schema while keeping every v0.4.1 capability (including
