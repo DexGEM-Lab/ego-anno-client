@@ -279,8 +279,12 @@ frame rate).
 
 The preview is the same two-pane layout the server produces: the source video
 with the measured joint skeletons overlaid, and a 3D pane with the camera
-trajectory and hands, above a subtitle band. Optional `--width`/`--height`
-change only the layout, never the calibration.
+trajectory and hands, above a subtitle band. The 3D pane is a level side-rear
+observer that follows the camera and hands slowly: world-up is estimated from
+the camera trajectory (the result's world frame is the first camera frame and
+carries no gravity), and `--world-up X,Y,Z` supplies it instead when the source
+recording's gravity is known. Optional `--width`/`--height` change only the
+layout, never the calibration.
 
 MANO hand surfaces require the licensed MANO model, which is not distributed
 with this client. Without `--mano-dir` the render draws the measured 21-joint

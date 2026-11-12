@@ -1008,6 +1008,20 @@ class DagResultTests(unittest.TestCase):
             cli.main(base + ["--inputs", "bundle", "--video", "clip.mp4"])
         with self.assertRaises(SystemExit):
             cli.main(base + ["--inputs", "bundle", "--fps", "15"])
+        with self.assertRaises(SystemExit):
+            cli.main(base + ["--inputs", "bundle", "--world-up", "0,-1,0"])
+
+    def test_world_up_is_validated_and_forwarded_to_the_renderer(self):
+        self.assertEqual(rendering._world_up_argument(None), [])
+        self.assertEqual(rendering._world_up_argument("0,-1,0"), ["--world-up", "0.0,-1.0,0.0"])
+        self.assertEqual(rendering._world_up_argument((0.1, -0.9, -0.4)), ["--world-up", "0.1,-0.9,-0.4"])
+        for bad in ("0,-1", "a,b,c", "0,0,0", "nan,1,0", (1.0, 2.0), "1,2,3,4"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ClientError, "--world-up"):
+                rendering._world_up_argument(bad)
+        self.video.write_bytes(b"placeholder")
+        with self.assertRaisesRegex(ClientError, "--world-up"):
+            rendering.render_video_result(self.result, self.video, self.output, world_up="0,0")
+        self.assertFalse(self.output.exists())
 
 
 class DagRenderCase(unittest.TestCase):
@@ -1102,6 +1116,10 @@ class RealDagRenderTests(DagRenderCase):
         rendering.render_video_result(self.result, self.video, self.output, width=1280, height=960)
         stream = self.probe(self.output)
         self.assertEqual([stream["width"], stream["height"]], [1280, 960])
+
+    def test_explicit_world_up_renders(self):
+        rendering.render_video_result(self.result, self.video, self.output, world_up="0,-1,0")
+        self.probe(self.output)
 
     def test_frame_count_mismatch_preserves_destination(self):
         self.make_video(count=2)

@@ -319,8 +319,23 @@ def _validate_dag_video(cv2, capture, count, requested_fps):
     return probed
 
 
+def _world_up_argument(world_up):
+    """Renderer flag for an explicit gravity-up vector, or nothing."""
+    if world_up is None:
+        return []
+    if isinstance(world_up, str):
+        world_up = world_up.split(",")
+    try:
+        values = [float(value) for value in world_up]
+    except (TypeError, ValueError):
+        raise ClientError("--world-up must be three comma-separated numbers x,y,z") from None
+    if len(values) != 3 or not all(math.isfinite(value) for value in values) or not any(values):
+        raise ClientError("--world-up must be a finite non-zero x,y,z vector")
+    return ["--world-up", ",".join("{!r}".format(value) for value in values)]
+
+
 def render_video_result(result, video, output, width=None, height=None, camera=None, fps=None,
-                        mano_dir=None):
+                        mano_dir=None, world_up=None):
     """Render a downloaded result against the exact video the job consumed.
 
     Supported results are the DAG ``ego.annotation.product_json.v3`` document
@@ -331,9 +346,11 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
 
     MANO surfaces need the licensed hand model, which this client does not
     distribute: without ``mano_dir`` the render draws the measured 21-joint
-    skeletons the result carries and prints that limitation. Returns the
-    destination ``Path``; no API key or network connection is used, and an
-    existing destination survives every failure.
+    skeletons the result carries and prints that limitation. ``world_up`` is an
+    optional gravity-up direction ``(x, y, z)`` in the result's world frame
+    (the first camera frame); when omitted the 3D pane estimates it from the
+    camera trajectory. Returns the destination ``Path``; no API key or network
+    connection is used, and an existing destination survives every failure.
     """
     temporary = None
     try:
@@ -341,6 +358,7 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
         video_path = Path(video).expanduser().resolve()
         destination = Path(output).expanduser().resolve()
         camera_path = Path(camera).expanduser().resolve() if camera is not None else None
+        world_up_flag = _world_up_argument(world_up)
         protected = [result_path, video_path]
         if camera_path is not None:
             protected.append(camera_path)
@@ -379,6 +397,7 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
             capture.release()
         if assets is not None:
             extra.extend(["--mano-dir", str(assets)])
+        extra.extend(world_up_flag)
         prepared = result_path
         if schema == DAG_SCHEMA and assets is None:
             print("notice: the licensed MANO hand model is not distributed with this client; "
