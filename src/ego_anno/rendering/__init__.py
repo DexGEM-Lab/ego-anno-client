@@ -157,13 +157,17 @@ def _encode_renderer_output(result_path, video_path, camera_path, destination, w
         os.replace(str(encoded), str(destination))
 
 
-def render_result(result, inputs, output, width=None, height=None):
+def render_result(result, inputs, output, width=None, height=None, mano_dir=None):
     """Render a saved e2e bundle and atomically publish a browser-playable MP4.
 
     ``inputs`` is the directory written by ``submit --save-inputs``. Its video
-    must be the exact uploaded bytes; no frame resampling or calibration/shape
-    estimation occurs. Returns the destination ``Path``. No API key or network
-    connection is used, and an existing destination survives every failure.
+    must be the exact uploaded bytes; no frame resampling or calibration
+    estimation occurs. With ``mano_dir`` (the licensed hand model, not
+    distributed with this client) one hand shape per side is fitted to the
+    clip's predicted bone lengths and MANO surfaces are drawn on the predicted
+    joints; without it both panes draw the predicted 21-joint skeletons.
+    Returns the destination ``Path``. No API key or network connection is
+    used, and an existing destination survives every failure.
     """
     try:
         result_path = Path(result).expanduser().resolve()
@@ -183,6 +187,7 @@ def render_result(result, inputs, output, width=None, height=None):
         expected_size = _validate_submission(submission, document, camera)
         if not video_path.is_file():
             raise ClientError("saved processed input video does not exist: {}".format(video_path))
+        extra = [] if mano_dir is None else ["--mano-dir", str(_check_mano_dir(mano_dir))]
         output_size = _check_output_dimensions(width, height, expected_size)
         if shutil.which("ffmpeg") is None:
             raise ClientError("offline rendering requires system ffmpeg with the libx264 encoder on PATH")
@@ -199,8 +204,8 @@ def render_result(result, inputs, output, width=None, height=None):
         finally:
             capture.release()
         _encode_renderer_output(result_path, video_path,
-                               camera_path if camera is not None else None,
-                                destination, output_size[0], output_size[1], [])
+                                camera_path if camera is not None else None,
+                                destination, output_size[0], output_size[1], extra)
         return destination
     except ClientError:
         raise
@@ -346,7 +351,10 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
 
     MANO surfaces need the licensed hand model, which this client does not
     distribute: without ``mano_dir`` the render draws the measured 21-joint
-    skeletons the result carries and prints that limitation. ``world_up`` is an
+    skeletons the result carries (and, for a DAG result, prints that
+    limitation). A Cosmos result carries no shape, so with ``mano_dir`` one
+    shape per side is fitted to the clip's median predicted bone lengths and
+    the surfaces are posed on the predicted joints. ``world_up`` is an
     optional gravity-up direction ``(x, y, z)`` in the result's world frame
     (the first camera frame); when omitted the 3D pane estimates it from the
     camera trajectory. Returns the destination ``Path``; no API key or network
