@@ -1145,19 +1145,47 @@ def _wrap_text(text: str, font: int, scale: float, thickness: int, max_width: in
     return lines
 
 
-def _draw_subtitle(canvas: np.ndarray, structured: str, narrative: str, frame_index: int, frame_count: int, band_height: int) -> None:
-    """Draw only the natural-language description in the bottom strip."""
+def _draw_subtitle(canvas: np.ndarray, structured: str, narrative: str, frame_index: int, frame_count: int,
+                   band_height: int, label_lines: list[str] | None = None, label_notice: str | None = None) -> None:
+    """Draw the AR label block and the natural-language description in the bottom strip.
+
+    Labels live only in this band; the pose/video panes are never covered.
+    ``label_notice`` is the explicit marker for absent/unlabeled input — the
+    renderer never invents label text from other fields.
+    """
     del structured, frame_index, frame_count
     height, width = canvas.shape[:2]
     y0 = height - band_height
     layer = canvas.copy()
     cv2.rectangle(layer, (0, y0), (width, height), (0, 0, 0), -1)
     cv2.addWeighted(layer, 0.72, canvas, 0.28, 0.0, canvas)
-    lines = _wrap_text(narrative, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 1, width - 36)
     y = y0 + 42
-    for line in lines[:3]:
+    if label_notice is not None:
+        cv2.putText(canvas, label_notice, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                    (80, 200, 255), 1, cv2.LINE_AA)
+        y += 27
+    elif label_lines:
+        for line in label_lines:
+            cv2.putText(canvas, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                        (120, 240, 160), 1, cv2.LINE_AA)
+            y += 27
+    lines = _wrap_text(narrative, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 1, width - 36)
+    remaining = max(0, (height - 6 - y)) // 27
+    for line in lines[:min(3, remaining)]:
         cv2.putText(canvas, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (248, 248, 248), 1, cv2.LINE_AA)
         y += 27
+
+
+def _label_lines_for_frame(segments: list, time_seconds: float, prefix: str, max_width: int) -> list[str]:
+    """Wrapped AR label lines active at a presentation time (half-open), capped at two."""
+    lines: list[str] = []
+    for start, end, text in segments:
+        if start <= time_seconds < end:
+            lines.extend(_wrap_text(prefix + text, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 1, max_width))
+    if len(lines) > 2:
+        lines = lines[:2]
+        lines[-1] = lines[-1].rstrip(" .") + " …"
+    return lines
 
 
 def _subtitle_for_frame(rows: list[dict], frame_index: int, cursor: int, *, cosmos: bool = False) -> tuple[str, str, int]:
@@ -1180,6 +1208,79 @@ def _subtitle_for_frame(rows: list[dict], frame_index: int, cursor: int, *, cosm
 
     narrative = str(row.get("总体描述") or "").strip()
     return "", narrative, cursor
+
+
+def _labels_module():
+    """The sibling labels module, both as a package import and as a script."""
+    if __package__:
+        from . import labels
+        return labels
+    try:
+        import labels
+        return labels
+    except ModuleNotFoundError as exc:
+        if exc.name != "labels":
+            raise
+        from importlib.util import module_from_spec, spec_from_file_location
+        spec = spec_from_file_location("labels", Path(__file__).with_name("labels.py"))
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+
+def _load_labels(path: Path):
+    """Load and validate a frozen label sidecar; hard errors, never repairs."""
+    labels = _labels_module()
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot read labels sidecar {path}: {exc}") from exc
+    try:
+        return labels.validate_sidecar(document)
+    except ValueError as exc:
+        raise SystemExit(f"labels sidecar is invalid: {exc}") from exc
+
+
+class _LabelClock:
+    """Map decoded frames to label seconds from container presentation times.
+
+    policy ``pts`` uses each frame's presentation time directly (zeroed at the
+    first rendered frame of the whole video); ``cfr_verified`` proves every
+    consecutive delta equals the first within 1.5 ms and then maps by frame
+    index. Both hard-fail when PTS is missing or non-monotonic: there is no
+    silent fallback that could mislabel frames under a trusted identity.
+    """
+
+    def __init__(self, policy: str):
+        if policy not in ("pts", "cfr_verified"):
+            raise ValueError("timing policy must be pts or cfr_verified")
+        self.policy = policy
+        self.first = None
+        self.last = None
+        self.delta = None
+        self.index = -1
+
+    def tick(self, capture, frame_index: int) -> float:
+        # Frame 0 legitimately has PTS 0; a backend without PTS support reports
+        # 0 for every frame and is caught by the monotonicity check below.
+        raw = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        if self.last is not None and raw <= self.last + 1e-6:
+            raise SystemExit(f"container does not provide usable monotonic frame PTS at frame "
+                             f"{frame_index + 1}; label mapping requires monotonic frame PTS")
+        self.index += 1
+        if self.first is None:
+            self.first = raw
+        elif self.policy == "cfr_verified":
+            delta = raw - self.last
+            if self.delta is None:
+                self.delta = delta
+            elif abs(delta - self.delta) > 0.0015:
+                raise SystemExit(f"video is not constant-frame-rate at frame {frame_index + 1}; "
+                                 "timing_policy=cfr_verified does not apply")
+        self.last = raw
+        if self.policy == "cfr_verified" and self.delta is not None:
+            return self.index * self.delta
+        return raw - self.first
 
 
 def _load_document(path: Path, camera_path: Path | None = None,
@@ -1500,6 +1601,10 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=None, help="output height; defaults to source height")
     parser.add_argument("--start-frame", type=int, default=1, help="first 1-based frame to render")
     parser.add_argument("--max-frames", type=int, default=None, help="optional number of frames to render")
+    parser.add_argument("--labels", type=Path, default=None,
+                        help="AR label sidecar (ego-anno-ar-labels/v1) to draw time-synced in the caption band")
+    parser.add_argument("--timing-policy", choices=("pts", "cfr_verified"), default="pts",
+                        help="label time mapping: container frame PTS (default) or verified-CFR index mapping")
     parser.add_argument("--world-up", type=str, default=None,
                         help="optional gravity up vector 'x,y,z' in the result's world frame; estimated when omitted")
     parser.add_argument("--layout", choices=("three-pane", "two-pane"), default="three-pane",
@@ -1524,6 +1629,15 @@ def main() -> int:
         args.annotation_json, args.camera, fit_shape=assets.fit_shape if assets is not None else None)
     frame_count = int(document["Metadata"]["帧数"])
     subtitles = document.get("字幕", [])
+    sidecar = _load_labels(args.labels) if args.labels is not None else None
+    if sidecar is None:
+        label_segments = None
+        label_notice = "AR labels: not provided"
+        label_prefix = "AR: "
+    else:
+        label_segments = sidecar["segments"]
+        label_notice = None if label_segments else "AR labels: no labeled intervals"
+        label_prefix = "AR: " if sidecar["target_identity_sha256"] else "AR (unverified): "
     if assets is None:
         assets = _load_assets_if_needed(args.mano_dir, joints, betas)
 
@@ -1598,15 +1712,27 @@ def main() -> int:
     cursor = 0
     while cursor < len(subtitles) and int(subtitles[cursor]["起始帧"][1]) < start + 1:
         cursor += 1
+    # Labels are indexed by the full video's presentation timeline: decoding
+    # starts at frame 0 whenever labels are present, even for a subrange render.
+    if label_segments is not None and start > 0:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    clock = _LabelClock(args.timing_policy) if label_segments is not None else None
     source_mesh_faces = 0
     world_mesh_faces = 0
     try:
-        for frame_index in range(start, stop):
+        for frame_index in range(0 if clock is not None else start, stop):
             ok, source = capture.read()
             if not ok:
                 if _is_cosmos(document):
                     raise SystemExit(f"cannot decode Cosmos processed video frame {frame_index}")
                 source = np.full((source_height or output_height, source_width or output_width, 3), 35, dtype=np.uint8)
+            if clock is not None:
+                label_time = clock.tick(capture, frame_index)
+                if frame_index < start:
+                    continue
+                label_lines = _label_lines_for_frame(label_segments, label_time, label_prefix, output_width - 36)
+            else:
+                label_lines = None
 
             frame_joints: list[np.ndarray] = [joints[0][frame_index], joints[1][frame_index]]
             meshes: list[np.ndarray | None] = [None, None]
@@ -1655,7 +1781,8 @@ def main() -> int:
                 right_title = "Camera and hands: side-rear follow view"
                 _put_text_mixed(canvas, left_title, (24, 64), title_size, (255, 255, 255), 2)
                 _put_text_mixed(canvas, right_title, (pane_width + 24, 64), title_size, (255, 255, 255), 2)
-            _draw_subtitle(canvas, structured, narrative, frame_index, frame_count, band_height)
+            _draw_subtitle(canvas, structured, narrative, frame_index, frame_count, band_height,
+                           label_lines=label_lines, label_notice=label_notice)
             writer.write(canvas)
     finally:
         writer.release()
@@ -1667,6 +1794,9 @@ def main() -> int:
     rendered = stop - start
     print(f"wrote {args.output} ({rendered} frames, source frames {start + 1}-{stop}, {output_width}x{output_height} @ {fps:g}fps)")
     print(f"mesh triangles drawn: source={source_mesh_faces}, world_candidates={world_mesh_faces}")
+    if sidecar is not None:
+        print(json.dumps({"labeling_sha256": sidecar["content_sha256"],
+                          "render_recipe_version": 1}, separators=(",", ":")))
     return 0
 
 

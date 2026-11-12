@@ -12,6 +12,7 @@ Two anchored entry points publish the same browser-playable MP4:
 The rendering algorithms are unmodified snapshots described by provenance.json.
 Only this wrapper handles the public input bundle, subprocesses, and publication.
 """
+import hashlib
 import importlib
 import json
 import math
@@ -110,6 +111,34 @@ def _layout_argument(layout):
     return ["--layout", layout]
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(str(path), "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _prepare_labels(labels, video_path):
+    """Validate a frozen label sidecar and bind it to the rendered video bytes.
+
+    The sidecar's input_sha256 must equal the SHA-256 of the exact video being
+    rendered: labels produced for any other clip fail here instead of drawing
+    approximate text under a trusted identity. Returns the resolved path.
+    """
+    from . import labels as labels_module
+    labels_path = Path(labels).expanduser().resolve()
+    document = _read_object(labels_path, "labels sidecar")
+    try:
+        sidecar = labels_module.validate_sidecar(document)
+    except ValueError as exc:
+        raise ClientError("labels sidecar is invalid: {}".format(exc)) from None
+    if sidecar["input_sha256"] != _sha256_file(video_path):
+        raise ClientError("labels sidecar input_sha256 does not match the video bytes; "
+                          "refusing to render labels from a different clip")
+    return labels_path
+
+
 def _default_size(layout, source_size):
     return list(THREE_PANE_SIZE) if layout == "three-pane" else source_size
 
@@ -173,7 +202,8 @@ def _encode_renderer_output(result_path, video_path, camera_path, destination, w
         os.replace(str(encoded), str(destination))
 
 
-def render_result(result, inputs, output, width=None, height=None, mano_dir=None, layout="three-pane"):
+def render_result(result, inputs, output, width=None, height=None, mano_dir=None, layout="three-pane",
+                  labels=None):
     """Render a saved e2e bundle and atomically publish a browser-playable MP4.
 
     ``inputs`` is the directory written by ``submit --save-inputs``. Its video
@@ -183,18 +213,24 @@ def render_result(result, inputs, output, width=None, height=None, mano_dir=None
     clip's predicted bone lengths and MANO surfaces are drawn on the predicted
     joints; without it the panes draw the predicted 21-joint skeletons.
     ``layout`` is ``"three-pane"`` (default, 1920x1080) or ``"two-pane"``
-    (source size). Returns the destination ``Path``. No API key or network
-    connection is used, and an existing destination survives every failure.
+    (source size). ``labels`` is an optional ego-anno-ar-labels/v1 sidecar
+    whose time-synced AR segments are drawn in the caption band; its
+    input_sha256 must match the saved video bytes. Returns the destination
+    ``Path``. No API key or network connection is used, and an existing
+    destination survives every failure.
     """
     try:
         layout_flag = _layout_argument(layout)
         result_path = Path(result).expanduser().resolve()
         inputs_path = Path(inputs).expanduser().resolve()
         destination = Path(output).expanduser().resolve()
+        labels_path = Path(labels).expanduser().resolve() if labels is not None else None
         video_path = inputs_path / "video.mp4"
         camera_path = inputs_path / "camera.json"
         submission_path = inputs_path / "submission.json"
         protected = [result_path, video_path.resolve(), camera_path.resolve(), submission_path.resolve()]
+        if labels_path is not None:
+            protected.append(labels_path)
         _refuse_collision(destination, protected)
         extra = [] if mano_dir is None else ["--mano-dir", str(_check_mano_dir(mano_dir))]
         document = _read_object(result_path, "result")
@@ -221,6 +257,8 @@ def render_result(result, inputs, output, width=None, height=None, mano_dir=None
                     actual_size, expected_size))
         finally:
             capture.release()
+        if labels_path is not None:
+            extra.extend(["--labels", str(_prepare_labels(labels_path, video_path))])
         _encode_renderer_output(result_path, video_path,
                                 camera_path if camera is not None else None,
                                 destination, output_size[0], output_size[1], extra + layout_flag)
@@ -358,7 +396,7 @@ def _world_up_argument(world_up):
 
 
 def render_video_result(result, video, output, width=None, height=None, camera=None, fps=None,
-                        mano_dir=None, world_up=None, layout="three-pane"):
+                        mano_dir=None, world_up=None, layout="three-pane", labels=None):
     """Render a downloaded result against the exact video the job consumed.
 
     Supported results are the DAG ``ego.annotation.product_json.v3`` document
@@ -378,9 +416,11 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
     camera trajectory; both 3D panes use the same up vector. ``layout`` is
     ``"three-pane"`` (default: hand overlay | side-rear follow view | upper-body
     skeleton, 1920x1080) or ``"two-pane"`` (the first two panes at the source
-    size); ``width``/``height`` rescale either layout proportionally. Returns
-    the destination ``Path``; no API key or network connection is used, and an
-    existing destination survives every failure.
+    size); ``width``/``height`` rescale either layout proportionally.
+    ``labels`` is an optional ego-anno-ar-labels/v1 sidecar whose time-synced
+    AR segments are drawn in the caption band; its input_sha256 must match
+    the video bytes. Returns the destination ``Path``; no API key or network
+    connection is used, and an existing destination survives every failure.
     """
     temporary = None
     try:
@@ -389,10 +429,13 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
         video_path = Path(video).expanduser().resolve()
         destination = Path(output).expanduser().resolve()
         camera_path = Path(camera).expanduser().resolve() if camera is not None else None
+        labels_path = Path(labels).expanduser().resolve() if labels is not None else None
         world_up_flag = _world_up_argument(world_up)
         protected = [result_path, video_path]
         if camera_path is not None:
             protected.append(camera_path)
+        if labels_path is not None:
+            protected.append(labels_path)
         _refuse_collision(destination, protected)
         document = _read_object(result_path, "result")
         schema = _result_schema(document)
@@ -430,6 +473,8 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
             extra.extend(["--mano-dir", str(assets)])
         extra.extend(world_up_flag)
         extra.extend(layout_flag)
+        if labels_path is not None:
+            extra.extend(["--labels", str(_prepare_labels(labels_path, video_path))])
         prepared = result_path
         if schema == DAG_SCHEMA and assets is None:
             print("notice: the licensed MANO hand model is not distributed with this client; "

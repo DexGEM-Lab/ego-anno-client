@@ -66,6 +66,8 @@ def main(argv=None):
                             help="three-pane (default, 1920x1080): overlay | follow view | upper-body "
                                  "skeleton; two-pane: overlay | follow view at the source size")
         render.add_argument("-o", "--output", required=True, help="output H.264 MP4")
+        render.add_argument("--labels",
+                            help="AR label sidecar (ego-anno-ar-labels/v1) drawn time-synced in the caption band")
         render.add_argument("--width", type=int)
         render.add_argument("--height", type=int)
         args = parser.parse_args(arguments)
@@ -93,12 +95,13 @@ def main(argv=None):
                     if getattr(args, name) is not None:
                         parser.error("--{} applies only to the --video form".format(name.replace("_", "-")))
                 output = render_result(args.result, args.inputs, args.output,
-                                       args.width, args.height, mano_dir=args.mano_dir, layout=args.layout)
+                                       args.width, args.height, mano_dir=args.mano_dir, layout=args.layout,
+                                       labels=args.labels)
             else:
                 output = render_video_result(args.result, args.video, args.output,
                                              width=args.width, height=args.height,
                                              camera=args.camera, fps=args.fps, mano_dir=args.mano_dir,
-                                             world_up=args.world_up, layout=args.layout)
+                                             world_up=args.world_up, layout=args.layout, labels=args.labels)
             print("Rendered {}".format(output))
             return 0
         key = os.environ.get("EGO_ANNO_API_KEY") or getpass.getpass("API key: ")

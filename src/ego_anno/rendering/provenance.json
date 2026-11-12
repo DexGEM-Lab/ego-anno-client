@@ -2,12 +2,12 @@
   "schema": "ego-anno-renderer-provenance/v1",
   "source_repository": "DexGEM-Lab/ego-compute",
   "source_commit": "2ba840be88c383a0c2b69903853f6b990dc51785",
-  "snapshot_policy": "The two Python files derive from byte-for-byte source snapshots; cosmos_e2e.py additionally carries the local cosmos-e2e-result/v2 converter and render_ego_json_overlay.py the matching schema dispatch added with client 0.5.0 and the three-pane layout. body_pane.py (the upper-body skeleton pane, numpy + OpenCV only) originates in this client and is the file the render service vendors back so that the website, the API render service and the SDK draw the same panes. No runtime checkout, model weights, fonts, videos, fixtures, or other source assets are included or required for Cosmos skeleton rendering.",
+  "snapshot_policy": "The two Python files derive from byte-for-byte source snapshots; cosmos_e2e.py additionally carries the local cosmos-e2e-result/v2 converter and render_ego_json_overlay.py the matching schema dispatch added with client 0.5.0 and the three-pane layout. body_pane.py (the upper-body skeleton pane, numpy + OpenCV only) originates in this client and is the file the render service vendors back so that the website, the API render service and the SDK draw the same panes. labels.py (the ego-anno-ar-labels/v1 sidecar contract and render-identity formula) originates in this client and is imported by the overlay like cosmos_e2e.py. No runtime checkout, model weights, fonts, videos, fixtures, or other source assets are included or required for Cosmos skeleton rendering.",
   "files": [
     {
       "source_path": "clusters/py312/render/src/render_pack/render_ego_json_overlay.py",
       "vendored_path": "render_ego_json_overlay.py",
-      "sha256": "2dbbb96bc21f56fa6eb2f7e525446d96a6dd7a33e3a8153de45e604879f699fc"
+      "sha256": "86ddd73ff154218767c4ad14bdaa45986262a01011d140481d6b77a2a71d25e7"
     },
     {
       "source_path": "clusters/py312/render/src/render_pack/cosmos_e2e.py",
@@ -18,6 +18,11 @@
       "source_path": "clusters/py312/render/src/render_pack/body_pane.py",
       "vendored_path": "body_pane.py",
       "sha256": "4f6e0cbe9f69ff6eabdad9a390015cfc99494a06f2d6dafa7b02138aa19c3839"
+    },
+    {
+      "source_path": "originates in this client (AR label contract module)",
+      "vendored_path": "labels.py",
+      "sha256": "fa9bf80cd03ad9476ab70379e90d3a0b8d0a534f86ebbfeaf0b3d2d43fe9febb"
     }
   ]
 }

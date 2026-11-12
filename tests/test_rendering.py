@@ -225,7 +225,7 @@ import ego_anno.rendering
         provenance = json.loads((package / "provenance.json").read_text(encoding="utf-8"))
         self.assertTrue(provenance["source_commit"].startswith("2ba840b"))
         self.assertEqual({entry["vendored_path"] for entry in provenance["files"]},
-                         {"body_pane.py", "cosmos_e2e.py", "render_ego_json_overlay.py"})
+                         {"body_pane.py", "cosmos_e2e.py", "labels.py", "render_ego_json_overlay.py"})
         for entry in provenance["files"]:
             self.assertEqual(hashlib.sha256((package / entry["vendored_path"]).read_bytes()).hexdigest(),
                              entry["sha256"])
@@ -1143,10 +1143,12 @@ class DagResultTests(unittest.TestCase):
         with mock.patch.object(rendering, "render_result", return_value=Path("out.mp4")) as render_result:
             self.assertEqual(cli.main(["render", "--result", "r.json", "--inputs", "bundle",
                                        "--mano-dir", "assets", "-o", "out.mp4"]), 0)
-        render_result.assert_called_once_with("r.json", "bundle", "out.mp4", None, None, mano_dir="assets", layout="three-pane")
+        render_result.assert_called_once_with("r.json", "bundle", "out.mp4", None, None, mano_dir="assets",
+                                              layout="three-pane", labels=None)
         with mock.patch.object(rendering, "render_result", return_value=Path("out.mp4")) as render_result:
             self.assertEqual(cli.main(["render", "--result", "r.json", "--inputs", "bundle", "-o", "out.mp4"]), 0)
-        render_result.assert_called_once_with("r.json", "bundle", "out.mp4", None, None, mano_dir=None, layout="three-pane")
+        render_result.assert_called_once_with("r.json", "bundle", "out.mp4", None, None, mano_dir=None,
+                                              layout="three-pane", labels=None)
         self.video.write_bytes(b"placeholder")
         with self.assertRaisesRegex(ClientError, "does not exist"):
             rendering.render_result(self.result, self.root, self.output, mano_dir=str(self.root / "absent"))
@@ -1321,6 +1323,127 @@ class RealDagRenderTests(DagRenderCase):
                                       mano_dir=os.environ["EGO_ANNO_MANO_DIR"])
         source_pane = self.panes(self.output, 0)[0]
         self.assertGreater(self.joint_pixels(source_pane), 0)
+
+
+def labels_sidecar(video_path, segments, target="c" * 64):
+    """A frozen ego-anno-ar-labels/v1 sidecar bound to the given video bytes."""
+    from ego_anno.rendering import labels as labels_module
+    normalized = labels_module._segments(segments, "segments")
+    return {"schema": "ego-anno-ar-labels/v1",
+            "content_sha256": labels_module.content_sha256(normalized),
+            "canonical_input_id": "test-clip",
+            "input_sha256": hashlib.sha256(video_path.read_bytes()).hexdigest(),
+            "timebase": {"clock": "uploaded_video_seconds", "origin": "first_frame_pts",
+                         "half_open": True, "fps": 15},
+            "target_identity_sha256": target,
+            "segments": segments}
+
+
+class LabelRenderTests(DagRenderCase):
+    """Time-synced AR label overlay on real rendered frames."""
+
+    def setUp(self):
+        super().setUp()
+        self.save_json(self.result, dag_document(count=75))
+        self.make_video(count=75)
+        self.labels_path = self.root / "labels.json"
+        self.renderer_module = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+
+    def write_labels(self, segments, **overrides):
+        sidecar = labels_sidecar(self.video, segments, **overrides)
+        self.save_json(self.labels_path, sidecar)
+        return sidecar
+
+    def band(self, frame_index):
+        """The caption band crop of one rendered frame."""
+        capture = self.cv2.VideoCapture(str(self.output))
+        try:
+            capture.set(self.cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = capture.read()
+        finally:
+            capture.release()
+        self.assertTrue(ok, "cannot decode rendered frame {}".format(frame_index))
+        height = frame.shape[0]
+        return frame[height - self.renderer_module._caption_band(height):]
+
+    def band_bright(self, frame_index, rows=60):
+        """Bright-pixel count in the top rows of the caption band of one frame."""
+        region = self.band(frame_index)[:rows]
+        return int((region.astype(int).sum(axis=2) > 200).sum())
+
+    def test_labeled_render_syncs_segments_to_frame_pts(self):
+        self.write_labels([
+            {"start_sec": 0.5, "end_sec": 1.0, "subtask": "pick up the cup"},
+            {"start_sec": 2.0, "end_sec": 3.0,
+             "subtask": "carry the cup across the room with a long descriptive sentence to force wrapping"},
+            {"start_sec": 1 / 15, "end_sec": 2 / 15, "subtask": "edge"},
+        ], target=None)
+        rendering.render_video_result(self.result, self.video, self.output,
+                                      layout="two-pane", labels=str(self.labels_path))
+        stream = self.probe(self.output)
+        self.assertEqual(int(stream["nb_read_frames"]), 75)
+        for frame_index, expect in ((0, 0), (9, 1), (22, 0), (37, 1), (60, 0), (1, 1), (2, 0)):
+            bright = self.band_bright(frame_index)
+            if expect:
+                self.assertGreater(bright, 0, "frame {} lost its label".format(frame_index + 1))
+            else:
+                self.assertEqual(bright, 0, "frame {} must stay in the gap".format(frame_index + 1))
+
+    def test_sidecar_bound_to_other_video_is_rejected(self):
+        sidecar = self.write_labels([{"start_sec": 0.0, "end_sec": 1.0, "subtask": "a"}])
+        sidecar["input_sha256"] = "0" * 64
+        self.save_json(self.labels_path, sidecar)
+        self.output.write_bytes(b"existing destination")
+        with self.assertRaisesRegex(ClientError, "does not match the video bytes"):
+            rendering.render_video_result(self.result, self.video, self.output,
+                                          labels=str(self.labels_path))
+        self.assertEqual(self.output.read_bytes(), b"existing destination")
+
+    def test_tampered_sidecar_is_rejected(self):
+        sidecar = self.write_labels([{"start_sec": 0.0, "end_sec": 1.0, "subtask": "a"}])
+        sidecar["content_sha256"] = "b" * 64
+        self.save_json(self.labels_path, sidecar)
+        with self.assertRaisesRegex(ClientError, "content_sha256 does not match"):
+            rendering.render_video_result(self.result, self.video, self.output,
+                                          labels=str(self.labels_path))
+        self.assertFalse(self.output.exists())
+
+    def test_missing_labels_draws_explicit_notice_and_never_fabricates(self):
+        original_result = self.result.read_bytes()
+        rendering.render_video_result(self.result, self.video, self.output, layout="two-pane")
+        self.assertGreater(self.band_bright(0), 0, "the no-labels notice must be visible")
+        self.assertGreater(self.band_bright(40), 0, "the no-labels notice is persistent")
+        self.assertEqual(self.result.read_bytes(), original_result)
+
+    def test_saved_bundle_render_with_labels(self):
+        inputs = self.root / "bundle"
+        inputs.mkdir()
+        self.save_json(inputs / "submission.json",
+                       {"schema": "ego-anno-e2e-input/v1", "pipeline": "e2e", "num_frames": 75,
+                        "fps": 15, "width": 640, "height": 480,
+                        "idempotency_key": "3107cf0b-5648-4f1c-9166-a63b4d0c632d",
+                        "annotation_job_id": None, "prompt": None})
+        shutil.copyfile(self.video, inputs / "video.mp4")
+        v2 = physical_result_v2(75)
+        self.save_json(self.result, v2)
+        self.write_labels([{"start_sec": 0.5, "end_sec": 1.0, "subtask": "pick up the cup"}])
+        rendering.render_result(self.result, inputs, self.output, layout="two-pane",
+                                labels=str(self.labels_path))
+        self.assertEqual(int(self.probe(self.output)["nb_read_frames"]), 75)
+        import numpy as np
+        self.assertFalse(np.array_equal(self.band(9), self.band(40)),
+                         "the labeled frame's band must differ from the gap frame's")
+
+    def test_cli_forwards_labels(self):
+        from ego_anno import cli
+        with mock.patch.object(rendering, "render_video_result", return_value=Path("out.mp4")) as render:
+            self.assertEqual(cli.main(["render", "--result", "r.json", "--video", "clip.mp4",
+                                       "--labels", "labels.json", "-o", "out.mp4"]), 0)
+        self.assertEqual(render.call_args[1]["labels"], "labels.json")
+        with mock.patch.object(rendering, "render_result", return_value=Path("out.mp4")) as render:
+            self.assertEqual(cli.main(["render", "--result", "r.json", "--inputs", "bundle",
+                                       "--labels", "labels.json", "-o", "out.mp4"]), 0)
+        self.assertEqual(render.call_args[1]["labels"], "labels.json")
 
 
 @unittest.skipUnless(os.environ.get("EGO_ANNO_REAL_RESULT_DIR"),
@@ -1640,9 +1763,15 @@ class InProcessRendererTests(unittest.TestCase):
         before = self.run_main(old)
         after = self.run_main(self.renderer, "--layout", "two-pane")
         self.assertEqual(len(before), len(after))
+        band = self.renderer._caption_band(480)
         for index, (a, b) in enumerate(zip(before, after)):
             self.assertEqual(a.shape, (480, 640, 3))
-            self.assertTrue(self.np.array_equal(a, b), "frame {} differs".format(index))
+            # The panes are pixel-identical; the caption band deliberately
+            # gained the explicit "AR labels: not provided" notice.
+            self.assertTrue(self.np.array_equal(a[:a.shape[0] - band], b[:b.shape[0] - band]),
+                            "frame {} pane region differs".format(index))
+            self.assertFalse(self.np.array_equal(a[-band:], b[-band:]),
+                             "frame {} band should carry the no-labels notice".format(index))
 
 
 if __name__ == "__main__":
