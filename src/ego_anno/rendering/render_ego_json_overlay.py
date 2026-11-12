@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Render a two-pane overlay from annotation JSON and the source video.
+"""Render the annotation overlay video from annotation JSON and the source video.
+
+The default three-pane layout shows the hand overlay, the side-rear follow view
+and the upper-body skeleton (body_pane.py); --layout two-pane keeps the first two.
 
 Annotation v3 and Cosmos e2e JSON are supported. Hands with finite beta use
 bundled MANO assets; hands without beta show their actual 21-joint skeleton.
@@ -1296,6 +1299,81 @@ def _render_world(size: tuple[int, int], pose: np.ndarray, centers: np.ndarray, 
     return canvas
 
 
+# Three-pane layout: overlay | follow view | upper-body skeleton, approved at 1920 px
+# as 760 / 580 / 580 columns over one full-width caption strip.
+_THREE_PANE_COLUMNS = (760, 580, 580)
+_THREE_PANE_TITLES = ("Hand joints overlay", "Camera and hands: side-rear follow view", "Upper-body skeleton")
+_THREE_PANE_REF = (1920, 914)
+
+
+def _caption_band(output_height: int) -> int:
+    return min(220, max(165, int(round(output_height * 0.145))))
+
+
+def _three_pane_layout(width: int, height: int) -> dict[str, object]:
+    """Pane rectangles (x, y, w, h): equal height, the columns fill the width."""
+    band = _caption_band(height)
+    pane_height = height - band
+    total = float(sum(_THREE_PANE_COLUMNS))
+    first = int(round(width * _THREE_PANE_COLUMNS[0] / total))
+    second = int(round((width - first) * _THREE_PANE_COLUMNS[1] / (total - _THREE_PANE_COLUMNS[0])))
+    widths = (first, second, width - first - second)
+    xs = (0, first, first + second)
+    return {"band": band, "pane_height": pane_height,
+            "panes": [(x, 0, w, pane_height) for x, w in zip(xs, widths)]}
+
+
+def _body_pane_module():
+    """The sibling body_pane module, both as a package import and as a script."""
+    if __package__:
+        from . import body_pane
+        return body_pane
+    try:
+        import body_pane
+    except ModuleNotFoundError as exc:
+        if exc.name != "body_pane":
+            raise
+        from importlib.util import module_from_spec, spec_from_file_location
+        spec = spec_from_file_location("body_pane", Path(__file__).with_name("body_pane.py"))
+        body_pane = module_from_spec(spec)
+        spec.loader.exec_module(body_pane)
+    return body_pane
+
+
+def _overlay_crop(joints_px: list[np.ndarray], source_size: tuple[int, int], pane_size: tuple[int, int],
+                  start: int, stop: int) -> tuple[int, int, int, int]:
+    """Static source window (x, y, w, h) with the pane's aspect, centred on the hands.
+
+    The largest window of the pane's aspect that fits the source, positioned once for
+    the clip at the middle of the annotated hand pixel range (frame centre without
+    hand pixels), so the overlay fills its pane without letterboxing or panning.
+    """
+    source_w, source_h = source_size
+    aspect = pane_size[0] / max(pane_size[1], 1)
+    if source_w / max(source_h, 1) > aspect:
+        crop_h, crop_w = source_h, min(source_w, max(1, int(round(source_h * aspect))))
+    else:
+        crop_w, crop_h = source_w, min(source_h, max(1, int(round(source_w / aspect))))
+    pixels = np.concatenate([np.asarray(side[start:stop], dtype=np.float64).reshape(-1, 2) for side in joints_px])
+    pixels = pixels[np.isfinite(pixels).all(axis=1)]
+    inside = pixels[(pixels[:, 0] >= 0) & (pixels[:, 0] < source_w) & (pixels[:, 1] >= 0) & (pixels[:, 1] < source_h)]
+    if len(inside):
+        centre = 0.5 * (inside.min(axis=0) + inside.max(axis=0))
+    else:
+        centre = np.asarray((source_w * 0.5, source_h * 0.5))
+    x = int(np.clip(round(centre[0] - crop_w / 2), 0, source_w - crop_w))
+    y = int(np.clip(round(centre[1] - crop_h / 2), 0, source_h - crop_h))
+    return x, y, crop_w, crop_h
+
+
+def _draw_pane_title(canvas: np.ndarray, x: int, text: str, scale: float) -> None:
+    """Pane title in the SDK title style: white Hershey simplex over a black outline."""
+    thickness = max(1, int(round(2 * scale)))
+    origin = (x + int(round(16 * scale)), int(round(40 * scale)))
+    cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.78 * scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+    cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.78 * scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+
 def _download_video_address(address: str) -> tuple[Path, Path | None]:
     parsed = urlparse(address)
     if parsed.scheme not in ("http", "https"):
@@ -1339,7 +1417,11 @@ def main() -> int:
     parser.add_argument("--max-frames", type=int, default=None, help="optional number of frames to render")
     parser.add_argument("--world-up", type=str, default=None,
                         help="optional gravity up vector 'x,y,z' in the result's world frame; estimated when omitted")
+    parser.add_argument("--layout", choices=("three-pane", "two-pane"), default="three-pane",
+                        help="three-pane (default, 1920x1080): overlay | follow view | upper-body skeleton; "
+                             "two-pane: overlay | follow view at the source size")
     args = parser.parse_args()
+    three_pane = args.layout == "three-pane"
     world_up = None
     if args.world_up is not None:
         try:
@@ -1375,13 +1457,24 @@ def main() -> int:
     source_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     _validate_source_video(document, capture)
 
-    output_width = int(args.width or source_width or 1920)
-    output_height = int(args.height or source_height or 1080)
+    if three_pane:
+        output_width = int(args.width or 1920)
+        output_height = int(args.height or 1080)
+    else:
+        output_width = int(args.width or source_width or 1920)
+        output_height = int(args.height or source_height or 1080)
     output_width -= output_width % 2
     output_height -= output_height % 2
-    band_height = min(220, max(165, int(round(output_height * 0.145))))
+    band_height = _caption_band(output_height)
     pane_height = output_height - band_height
     pane_width = output_width // 2
+    if three_pane:
+        layout = _three_pane_layout(output_width, output_height)
+        overlay_rect, world_rect, body_rect = layout["panes"]
+        world_size = (world_rect[2], pane_height)
+        title_scale = min(pane_height / _THREE_PANE_REF[1], output_width / _THREE_PANE_REF[0])
+    else:
+        world_size = (pane_width, pane_height)
 
     start = max(0, int(args.start_frame) - 1)
     stop = frame_count if args.max_frames is None else min(frame_count, start + max(0, int(args.max_frames)))
@@ -1399,8 +1492,14 @@ def main() -> int:
     # The observer track is solved offline from every valid camera pose and
     # every hand joint, so per-frame rendering only looks its view up.
     world_cam_verts, _ = _build_cinema_camera(s=0.085)
-    views, track = _follow_view_track(poses, pose_valid, joints, world_cam_verts, pane_width, pane_height,
+    views, track = _follow_view_track(poses, pose_valid, joints, world_cam_verts, world_size[0], world_size[1],
                                       fps=fps, world_up=world_up)
+    if three_pane:
+        # Same up vector as the follow view: both 3D panes stand on one gravity.
+        body_pane = _body_pane_module().BodyPane(poses, pose_valid, joints, track["up"], fps,
+                                                 (body_rect[2], pane_height))
+        crop = _overlay_crop(joints_px, (source_width, source_height), (overlay_rect[2], pane_height),
+                             start, stop)
     gravity = track["gravity"]
     print("world-up: branch={} eigen_ratio={:.2f} up=[{:.4f}, {:.4f}, {:.4f}] observer_side={}".format(
         gravity["branch"], float(gravity["eigen_ratio"]), *[float(v) for v in track["up"]],
@@ -1429,7 +1528,7 @@ def main() -> int:
             _draw_projection_notice(source, intrinsic)
 
             if pose_valid[frame_index]:
-                world = _render_world((pane_width, pane_height), poses[frame_index], centers, frame_index, frame_joints, meshes, assets,
+                world = _render_world(world_size, poses[frame_index], centers, frame_index, frame_joints, meshes, assets,
                                       [betas[0][frame_index], betas[1][frame_index]], intrinsic,
                                       (source_width, source_height), view=views[frame_index],
                                       floor=track["floor"])
@@ -1437,20 +1536,34 @@ def main() -> int:
                     if meshes[side] is not None:
                         world_mesh_faces += len(assets.faces(side_name))
             else:
-                world = np.full((pane_height, pane_width, 3), BG, dtype=np.uint8)
+                world = np.full((world_size[1], world_size[0], 3), BG, dtype=np.uint8)
                 cv2.putText(world, "camera pose unavailable", (20, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 2, cv2.LINE_AA)
 
             structured, narrative, cursor = _subtitle_for_frame(
                 subtitles, frame_index, cursor, cosmos=_is_cosmos(document)
             )
             canvas = np.full((output_height, output_width, 3), 20, dtype=np.uint8)
-            canvas[:pane_height, :pane_width] = _resize_to_contain(source, pane_width, pane_height)
-            canvas[:pane_height, pane_width:pane_width * 2] = world
-            title_size = max(30, int(round(pane_height * 0.043)))
-            left_title = "Hand joints overlay"
-            right_title = "Camera and hands: side-rear follow view"
-            _put_text_mixed(canvas, left_title, (24, 64), title_size, (255, 255, 255), 2)
-            _put_text_mixed(canvas, right_title, (pane_width + 24, 64), title_size, (255, 255, 255), 2)
+            if three_pane:
+                x, y, w, h = crop
+                canvas[:pane_height, :overlay_rect[2]] = cv2.resize(
+                    source[y:y + h, x:x + w], (overlay_rect[2], pane_height), interpolation=cv2.INTER_AREA)
+                canvas[:pane_height, world_rect[0]:world_rect[0] + world_rect[2]] = world
+                faces = [assets.faces(name) if meshes[side] is not None else None
+                         for side, name in ((0, "left"), (1, "right"))]
+                canvas[:pane_height, body_rect[0]:body_rect[0] + body_rect[2]] = body_pane.render(
+                    frame_index, frame_joints, meshes, faces)
+                for rect in (world_rect, body_rect):
+                    canvas[:pane_height, max(0, rect[0] - 1):rect[0] + 1] = 60
+                for rect, title in zip(layout["panes"], _THREE_PANE_TITLES):
+                    _draw_pane_title(canvas, rect[0], title, title_scale)
+            else:
+                canvas[:pane_height, :pane_width] = _resize_to_contain(source, pane_width, pane_height)
+                canvas[:pane_height, pane_width:pane_width * 2] = world
+                title_size = max(30, int(round(pane_height * 0.043)))
+                left_title = "Hand joints overlay"
+                right_title = "Camera and hands: side-rear follow view"
+                _put_text_mixed(canvas, left_title, (24, 64), title_size, (255, 255, 255), 2)
+                _put_text_mixed(canvas, right_title, (pane_width + 24, 64), title_size, (255, 255, 255), 2)
             _draw_subtitle(canvas, structured, narrative, frame_index, frame_count, band_height)
             writer.write(canvas)
     finally:
