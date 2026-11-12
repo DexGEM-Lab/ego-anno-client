@@ -28,6 +28,10 @@ def sidecar(**overrides):
 
 
 class MinimalDocumentTests(unittest.TestCase):
+    def test_reported_renderer_version_matches_sdk(self):
+        from ego_anno import __version__
+        self.assertEqual(labels.RENDERER_VERSION, __version__)
+
     def test_validate_sorts_and_normalizes(self):
         doc = {"schema": "ego-anno-ar-labels/v1", "clock": "clip_local_seconds",
                "labels": [dict(SEGMENTS[1], start_sec=0), SEGMENTS[0]]}

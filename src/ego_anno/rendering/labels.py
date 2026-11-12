@@ -36,7 +36,7 @@ RENDER_RECIPE_VERSION = 1
 # version string the render identity pins. The render worker imports both
 # from here so there is exactly one source.
 RENDERER_RECIPE_ID = "egodex-render/0.6.0-joint-labels/v1"
-RENDERER_VERSION = "0.6.0"
+RENDERER_VERSION = "0.6.1"
 
 
 def _canonical(payload):
