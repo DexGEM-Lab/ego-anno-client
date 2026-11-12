@@ -19,7 +19,7 @@ def sidecar(**overrides):
         "canonical_input_id": "clip-024a",
         "input_sha256": "a" * 64,
         "timebase": {"clock": "uploaded_video_seconds", "origin": "first_frame_pts",
-                     "half_open": True, "fps": 15},
+                     "half_open": True, "fps": 15, "duration_sec": 143, "record_offset_sec": 0},
         "target_identity_sha256": None,
         "segments": SEGMENTS,
     }
@@ -90,6 +90,8 @@ class SidecarTests(unittest.TestCase):
         self.assertEqual(checked["canonical_input_id"], "clip-024a")
         self.assertIsNone(checked["target_identity_sha256"])
         self.assertEqual(checked["timebase"]["fps"], 15.0)
+        self.assertEqual(checked["timebase"]["duration_sec"], 143.0)
+        self.assertEqual(checked["timebase"]["record_offset_sec"], 0.0)
         self.assertEqual([(s, e) for s, e, _ in checked["segments"]], [(0.0, 1.0), (2.0, 3.5)])
 
     def test_content_sha256_matches_the_frozen_formula(self):
@@ -117,19 +119,24 @@ class SidecarTests(unittest.TestCase):
             labels.validate_sidecar(document)
 
     def test_timebase_is_validated(self):
+        good = {"clock": "uploaded_video_seconds", "origin": "first_frame_pts",
+                "half_open": True, "fps": 15, "duration_sec": 143, "record_offset_sec": 0}
         with self.assertRaisesRegex(ValueError, "timebase.clock"):
-            labels.validate_sidecar(sidecar(timebase={"clock": "recording_seconds",
-                                                      "origin": "first_frame_pts", "half_open": True, "fps": 15}))
+            labels.validate_sidecar(sidecar(timebase=dict(good, clock="recording_seconds")))
         with self.assertRaisesRegex(ValueError, "timebase.half_open"):
-            labels.validate_sidecar(sidecar(timebase={"clock": "uploaded_video_seconds",
-                                                      "origin": "first_frame_pts", "half_open": False, "fps": 15}))
+            labels.validate_sidecar(sidecar(timebase=dict(good, half_open=False)))
         with self.assertRaisesRegex(ValueError, "timebase.fps"):
-            labels.validate_sidecar(sidecar(timebase={"clock": "uploaded_video_seconds",
-                                                      "origin": "first_frame_pts", "half_open": True, "fps": 0}))
+            labels.validate_sidecar(sidecar(timebase=dict(good, fps=0)))
+        with self.assertRaisesRegex(ValueError, "timebase.duration_sec"):
+            labels.validate_sidecar(sidecar(timebase=dict(good, duration_sec=0)))
+        with self.assertRaisesRegex(ValueError, "timebase.record_offset_sec"):
+            labels.validate_sidecar(sidecar(timebase=dict(good, record_offset_sec=-1)))
+        for key in ("fps", "duration_sec", "record_offset_sec"):
+            missing = {k: v for k, v in good.items() if k != key}
+            with self.assertRaisesRegex(ValueError, "exactly"):
+                labels.validate_sidecar(sidecar(timebase=missing))
         with self.assertRaisesRegex(ValueError, "exactly"):
-            labels.validate_sidecar(sidecar(timebase={"clock": "uploaded_video_seconds",
-                                                      "origin": "first_frame_pts", "half_open": True,
-                                                      "fps": 15, "duration_sec": 143}))
+            labels.validate_sidecar(sidecar(timebase=dict(good, extra=1)))
 
     def test_target_is_null_or_hex(self):
         checked = labels.validate_sidecar(sidecar(target_identity_sha256="c" * 64))

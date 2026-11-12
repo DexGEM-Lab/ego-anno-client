@@ -1334,7 +1334,8 @@ def labels_sidecar(video_path, segments, target="c" * 64):
             "canonical_input_id": "test-clip",
             "input_sha256": hashlib.sha256(video_path.read_bytes()).hexdigest(),
             "timebase": {"clock": "uploaded_video_seconds", "origin": "first_frame_pts",
-                         "half_open": True, "fps": 15},
+                         "half_open": True, "fps": 15, "duration_sec": 5.0,
+                         "record_offset_sec": 0.0},
             "target_identity_sha256": target,
             "segments": segments}
 

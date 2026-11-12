@@ -105,20 +105,33 @@ def content_sha256(segments):
 
 
 def validate_timebase(timebase):
-    """Validate the frozen timebase object; return it with its numeric fps."""
+    """Validate the frozen timebase object; return it normalized.
+
+    The object carries exactly six fields: the three clock constants plus
+    ``fps``, ``duration_sec`` and ``record_offset_sec`` (the label clock's
+    rate, extent and offset on the uploaded video). Both sides of the
+    render identity hash exactly this object.
+    """
     if not isinstance(timebase, dict):
         raise ValueError("timebase must be an object")
-    expected = dict(TIMEBASE)
-    fps = timebase.get("fps")
-    if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
-        raise ValueError("timebase.fps must be a finite positive number")
-    for key, value in expected.items():
+    if set(timebase) != set(TIMEBASE) | {"fps", "duration_sec", "record_offset_sec"}:
+        raise ValueError("timebase must contain exactly clock, origin, half_open, "
+                         "fps, duration_sec and record_offset_sec")
+    for key, value in TIMEBASE.items():
         if timebase.get(key) != value:
             raise ValueError("timebase.{} must be {!r}".format(key, value))
-    if set(timebase) != set(expected) | {"fps"}:
-        raise ValueError("timebase must contain exactly clock, origin, half_open and fps")
-    return {"clock": timebase["clock"], "origin": timebase["origin"],
-            "half_open": True, "fps": float(fps)}
+    normalized = {"clock": timebase["clock"], "origin": timebase["origin"], "half_open": True}
+    for key in ("fps", "duration_sec", "record_offset_sec"):
+        value = timebase.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("timebase.{} must be a finite number".format(key))
+        if key == "record_offset_sec":
+            if value < 0:
+                raise ValueError("timebase.record_offset_sec must be >= 0")
+        elif value <= 0:
+            raise ValueError("timebase.{} must be positive".format(key))
+        normalized[key] = float(value)
+    return normalized
 
 
 def validate_sidecar(document):
