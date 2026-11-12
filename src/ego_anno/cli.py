@@ -89,11 +89,11 @@ def main(argv=None):
             if (args.inputs is None) == (args.video is None):
                 parser.error("provide exactly one of --inputs DIR (saved e2e bundle) or --video FILE")
             if args.inputs is not None:
-                for name in ("camera", "mano_dir", "fps", "world_up"):
+                for name in ("camera", "fps", "world_up"):
                     if getattr(args, name) is not None:
                         parser.error("--{} applies only to the --video form".format(name.replace("_", "-")))
                 output = render_result(args.result, args.inputs, args.output,
-                                       args.width, args.height, layout=args.layout)
+                                       args.width, args.height, mano_dir=args.mano_dir, layout=args.layout)
             else:
                 output = render_video_result(args.result, args.video, args.output,
                                              width=args.width, height=args.height,

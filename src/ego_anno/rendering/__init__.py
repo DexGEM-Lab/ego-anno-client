@@ -173,15 +173,18 @@ def _encode_renderer_output(result_path, video_path, camera_path, destination, w
         os.replace(str(encoded), str(destination))
 
 
-def render_result(result, inputs, output, width=None, height=None, layout="three-pane"):
+def render_result(result, inputs, output, width=None, height=None, mano_dir=None, layout="three-pane"):
     """Render a saved e2e bundle and atomically publish a browser-playable MP4.
 
     ``inputs`` is the directory written by ``submit --save-inputs``. Its video
-    must be the exact uploaded bytes; no frame resampling or calibration/shape
-    estimation occurs. ``layout`` is ``"three-pane"`` (default, 1920x1080) or
-    ``"two-pane"`` (source size). Returns the destination ``Path``. No API key
-    or network connection is used, and an existing destination survives every
-    failure.
+    must be the exact uploaded bytes; no frame resampling or calibration
+    estimation occurs. With ``mano_dir`` (the licensed hand model, not
+    distributed with this client) one hand shape per side is fitted to the
+    clip's predicted bone lengths and MANO surfaces are drawn on the predicted
+    joints; without it the panes draw the predicted 21-joint skeletons.
+    ``layout`` is ``"three-pane"`` (default, 1920x1080) or ``"two-pane"``
+    (source size). Returns the destination ``Path``. No API key or network
+    connection is used, and an existing destination survives every failure.
     """
     try:
         layout_flag = _layout_argument(layout)
@@ -193,6 +196,7 @@ def render_result(result, inputs, output, width=None, height=None, layout="three
         submission_path = inputs_path / "submission.json"
         protected = [result_path, video_path.resolve(), camera_path.resolve(), submission_path.resolve()]
         _refuse_collision(destination, protected)
+        extra = [] if mano_dir is None else ["--mano-dir", str(_check_mano_dir(mano_dir))]
         document = _read_object(result_path, "result")
         if document.get("schema") not in COSMOS_SCHEMAS:
             raise ClientError("offline rendering of a saved bundle only accepts {}; ".format(
@@ -218,8 +222,8 @@ def render_result(result, inputs, output, width=None, height=None, layout="three
         finally:
             capture.release()
         _encode_renderer_output(result_path, video_path,
-                               camera_path if camera is not None else None,
-                                destination, output_size[0], output_size[1], layout_flag)
+                                camera_path if camera is not None else None,
+                                destination, output_size[0], output_size[1], extra + layout_flag)
         return destination
     except ClientError:
         raise
@@ -365,7 +369,10 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
 
     MANO surfaces need the licensed hand model, which this client does not
     distribute: without ``mano_dir`` the render draws the measured 21-joint
-    skeletons the result carries and prints that limitation. ``world_up`` is an
+    skeletons the result carries (and, for a DAG result, prints that
+    limitation). A Cosmos result carries no shape, so with ``mano_dir`` one
+    shape per side is fitted to the clip's median predicted bone lengths and
+    the surfaces are posed on the predicted joints. ``world_up`` is an
     optional gravity-up direction ``(x, y, z)`` in the result's world frame
     (the first camera frame); when omitted the 3D pane estimates it from the
     camera trajectory; both 3D panes use the same up vector. ``layout`` is

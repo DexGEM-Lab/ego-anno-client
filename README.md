@@ -22,7 +22,7 @@ From a fresh directory, run:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install "ego-anno-client[render] @ https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.5.0/ego_anno_client-0.5.0-py3-none-any.whl"
+.venv/bin/python -m pip install "ego-anno-client[render] @ https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.6.0/ego_anno_client-0.6.0-py3-none-any.whl"
 
 # Set EGO_ANNO_API_KEY privately in the environment before running the client.
 .venv/bin/ego-anno submit --pipeline e2e --video ./clip.mp4 \
@@ -38,7 +38,9 @@ On Windows, use `.venv\\Scripts\\python.exe` and `.venv\\Scripts\\ego-anno.exe`.
 If known, add `--camera ./camera.json` to **submit**; the client saves its
 rescaled calibration for render automatically. Without calibration the MP4
 shows the source video and predicted 3D skeleton/trajectory, but does **not**
-invent a source-video projection. Without beta, no MANO mesh is rendered.
+invent a source-video projection. Add `--mano-dir` (licensed hand model, see
+[section 6](#6-render-results-offline)) to draw MANO hand surfaces instead of
+skeletons.
 
 Success means: the job is `succeeded`, downloaded JSON has schema
 `cosmos-e2e-result/v2` with `num_frames - 1` rows of 156 finite action values,
@@ -79,20 +81,22 @@ The e2e billing ratio (default 0.1) is a deployment setting.
 ## 1. Download and install the client
 
 Install Python 3.8+ with pip, preferably in a virtual environment. Get the
-released client from the public [v0.5.0 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.5.0).
+released client from the public [v0.6.0 Release](https://github.com/DexGEM-Lab/ego-anno-client/releases/tag/v0.6.0).
 Install its wheel directly (no Git checkout required):
 
 ```bash
-python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.5.0/ego_anno_client-0.5.0-py3-none-any.whl"
+python3 -m pip install "https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.6.0/ego_anno_client-0.6.0-py3-none-any.whl"
 ego-anno --help
 ```
 
-Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.5.0/ego_anno_client-0.5.0-py3-none-any.whl)
+Alternatively, [download the wheel](https://github.com/DexGEM-Lab/ego-anno-client/releases/download/v0.6.0/ego_anno_client-0.6.0-py3-none-any.whl)
 from that Release and install the local file:
 
 ```bash
-python3 -m pip install ./ego_anno_client-0.5.0-py3-none-any.whl
+python3 -m pip install ./ego_anno_client-0.6.0-py3-none-any.whl
 ```
+
+The v0.6.0 wheel renders a three-pane 1920x1080 MP4 by default: the video with hand overlay, a gravity-level side-rear follow view of the camera and hands (smoothed offline: no jitter, no roll, level floor grid, camera trail), and an upper-body skeleton whose head is the camera and whose wrists are the annotated hands. `--layout two-pane` keeps the previous layout, `--world-up X,Y,Z` overrides the estimated gravity, and `--mano-dir` now also draws MANO surfaces for Cosmos e2e results (one hand shape per side fitted to the predicted bone lengths). It keeps every v0.5.0 capability.
 
 The v0.5.0 wheel admits 31–9001 frame e2e clips and renders the hand+head
 `cosmos-e2e-result/v2` schema while keeping every v0.4.1 capability (including
@@ -254,6 +258,7 @@ job costs no rendering time. Render locally when you want a video:
 | --- | --- |
 | A `dag` result and the exact video you submitted | `ego-anno render --result annotation.json --video clip.mp4 -o preview.mp4` |
 | An `e2e` result and its saved inputs | `ego-anno render --result annotation.json --inputs ./run/inputs -o preview.mp4` |
+| Either, plus the licensed MANO model | add `--mano-dir /path/to/hand_model` to draw hand surfaces |
 
 Install with the `[render]` extra (see
 [section 1](#1-download-and-install-the-client)). The package contains the
@@ -331,9 +336,17 @@ dimensions must match. The original temporary video is deleted without
 The preview keeps all N video frames. I0 has no hand prediction; action row k
 is shown on I(k+1). Translations/joints are already physical meters and are
 not inverse-normalized again. Camera motion is integrated with I0 as world
-origin. Hand visibility/object classes and MANO beta are not inferred.
+origin. Hand visibility/object classes are not inferred.
 The command writes H.264/yuv420p/faststart MP4 atomically and preserves an
 existing output if rendering fails. It does not overwrite bundle inputs.
+
+An `e2e` result carries predicted joints but no hand shape. With `--mano-dir`
+(the same licensed assets as for `dag` results) one MANO shape per hand is
+fitted to the clip: the rest-pose bone lengths are matched by least squares to
+the median predicted bone lengths over the clip (|beta| <= 3, mean shape when
+fewer than three frames carry the hand), and the surface is posed on the
+predicted joints exactly as for a `dag` result. Without `--mano-dir` both
+panes draw the predicted 21-joint skeletons.
 
 The renderer snapshot's source commit/hashes are recorded in the installed
 `ego_anno/rendering/provenance.json`; this is provenance, not a runtime download.

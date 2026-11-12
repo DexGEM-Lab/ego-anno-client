@@ -1,14 +1,32 @@
 """Convert physical CosmosHandPose147 predictions to the existing render view.
 
-This does not normalize actions, estimate intrinsics, classify visibility, or
-fit a MANO surface. The world origin is camera I0; action row k supplies the
-camera delta I_k -> I_(k+1) and hands at I_(k+1), never hands at I0.
+This does not normalize actions, estimate intrinsics, or classify visibility.
+The world origin is camera I0; action row k supplies the camera delta
+I_k -> I_(k+1) and hands at I_(k+1), never hands at I0.
+
+Cosmos predicts joints, not a hand shape. Both converters accept an optional
+``fit_shape(side, joints_camera)`` callable (the renderer passes
+``HandSurfaceAssets.fit_shape`` when hand assets are available) that returns
+one shape vector for the whole clip; it is written to every frame's
+``beta参数`` so the surface path renders. Without it ``beta参数`` stays None.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
+
+ShapeFitter = Callable[[str, np.ndarray], np.ndarray]
+
+
+def _clip_shape(fit_shape: ShapeFitter | None, side: str, joints_camera: np.ndarray) -> list[float] | None:
+    """Fit one finite 10-vector for ``side`` from the clip's camera-frame joints, or None."""
+    if fit_shape is None:
+        return None
+    beta = np.asarray(fit_shape(side, np.asarray(joints_camera, dtype=np.float64)), dtype=np.float64)
+    if beta.shape != (10,) or not np.isfinite(beta).all():
+        raise ValueError(f"hand shape fit for the {side} hand must return 10 finite values")
+    return beta.tolist()
 
 
 class CosmosE2EDocument:
@@ -72,7 +90,8 @@ class CosmosE2EDocument:
         return [row.tolist() if np.isfinite(row).all() else [None, None] for row in pixels]
 
     @classmethod
-    def convert(cls, document: dict, camera: dict | None = None) -> dict[str, Any]:
+    def convert(cls, document: dict, camera: dict | None = None,
+                fit_shape: ShapeFitter | None = None) -> dict[str, Any]:
         if document.get("schema") != cls.SCHEMA:
             raise ValueError(f"expected {cls.SCHEMA}")
         actions = np.asarray(document.get("action"), dtype=np.float64)
@@ -123,10 +142,11 @@ class CosmosE2EDocument:
             wrist_poses[:, :3, :3] = wrist_rotation
             wrist_poses[:, :3, 3] = wrist_translation
             world_wrists = poses[1:] @ wrist_poses
+            beta = _clip_shape(fit_shape, side, camera_joints)
             for index in range(count):
                 hands[side_index].append({
                     "左或右": side,
-                    "beta参数": None,
+                    "beta参数": beta,
                     "手部21点坐标": world_joints[index].tolist(),
                     "手部21点投影坐标": cls._project(camera_joints[index], intrinsic),
                     "整手姿态": world_wrists[index].tolist(),
@@ -174,7 +194,8 @@ class CosmosE2EHeadDocument:
     SCHEMA = "cosmos-e2e-result/v2"
 
     @classmethod
-    def convert(cls, document: dict, camera: dict | None = None) -> dict[str, Any]:
+    def convert(cls, document: dict, camera: dict | None = None,
+                fit_shape: ShapeFitter | None = None) -> dict[str, Any]:
         if document.get("schema") != cls.SCHEMA:
             raise ValueError(f"expected {cls.SCHEMA}")
         count = document.get("num_frames")
@@ -223,10 +244,11 @@ class CosmosE2EHeadDocument:
                 np.einsum("tij,tnj->tni", rotations[1:], camera_joints)
                 + poses[1:, None, :3, 3]
             )
+            beta = _clip_shape(fit_shape, side, camera_joints)
             for index in range(count - 1):
                 hands[side_index].append({
                     "左或右": side,
-                    "beta参数": None,
+                    "beta参数": beta,
                     "手部21点坐标": world_joints[index].tolist(),
                     "手部21点投影坐标": CosmosE2EDocument._project(camera_joints[index], intrinsic),
                     "整手姿态": None,

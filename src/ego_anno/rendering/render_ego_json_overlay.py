@@ -80,6 +80,11 @@ MANO_PARENTS = np.asarray((-1, 0, 1, 2, 0, 4, 5, 0, 7, 8, 0, 10, 11, 0, 13, 14),
 DISTAL_TIPS = {3: (320, 8), 6: (443, 12), 9: (672, 20), 12: (555, 16), 15: (744, 4)}
 FINGER_CHAINS = ((1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12), (13, 14, 15))
 PALM_MCP = np.asarray((1, 4, 7, 10, 13), dtype=np.int64)
+# Parent of every JSON21 joint (wrist 0, then four joints per finger).
+JSON21_PARENTS = np.asarray((-1, 0, 1, 2, 3, 0, 5, 6, 7, 0, 9, 10, 11, 0, 13, 14, 15, 0, 17, 18, 19), dtype=np.int64)
+SHAPE_BOUND = 3.0            # |beta| limit: PCA standard deviations of the hand shape space
+SHAPE_PRIOR_MM2 = 1.0        # penalty per beta^2, in mm^2 of bone-length residual
+SHAPE_MIN_FRAMES = 3         # fewer finite hand frames fall back to the mean shape
 
 
 def _normalize(value: np.ndarray, fallback: np.ndarray) -> np.ndarray:
@@ -150,6 +155,65 @@ class _HandModelUnpickler(pickle.Unpickler):
         if (module, name) in (("chumpy.ch", "Ch"), ("chumpy.reordering", "Select")):
             return _LegacyArrayStub
         return super().find_class(module, name)
+
+
+def _rest_joints21_linear(model: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Rest-pose JSON21 joints as base + dirs @ beta (metres).
+
+    The 16 kinematic joints come from the regressor; the five tips are the
+    vertices ``reconstruct`` also uses, so the fitted lengths are exactly the
+    ones the posed surface will span.
+    """
+    template, shapedirs, regressor = model["v_template"], model["shapedirs"], model["J_regressor"]
+    base = np.zeros((21, 3), dtype=np.float64)
+    dirs = np.zeros((21, 3, shapedirs.shape[2]), dtype=np.float64)
+    base[MANO16_TO_JSON21] = regressor @ template
+    dirs[MANO16_TO_JSON21] = np.einsum("jv,vck->jck", regressor, shapedirs)
+    for tip_vertex, tip_joint in DISTAL_TIPS.values():
+        base[tip_joint] = template[tip_vertex]
+        dirs[tip_joint] = shapedirs[tip_vertex]
+    return base, dirs
+
+
+def _bone_lengths21(joints: np.ndarray) -> np.ndarray:
+    """Lengths of the 20 JSON21 bones (child joints 1..20), last axis of ``joints``."""
+    joints = np.asarray(joints, dtype=np.float64)
+    children = np.arange(1, 21)
+    return np.linalg.norm(joints[..., children, :] - joints[..., JSON21_PARENTS[children], :], axis=-1)
+
+
+def fit_shape_to_bone_lengths(model: dict[str, np.ndarray], target_lengths: np.ndarray,
+                              prior: float = SHAPE_PRIOR_MM2, bound: float = SHAPE_BOUND,
+                              iterations: int = 40) -> np.ndarray:
+    """Least-squares beta whose rest-pose bone lengths match ``target_lengths`` (metres).
+
+    Bone lengths are the pose-invariant part of a joint prediction, so this is
+    the shape fit available when a result carries joints but no shape. Twenty
+    lengths constrain ten components only weakly in the high-index directions:
+    without the prior those run to the bound to remove sub-0.1 mm residual, so
+    the Gauss-Newton solve is damped by ``prior`` mm^2 per beta^2 and projected
+    onto |beta| <= bound.
+    """
+    base, dirs = _rest_joints21_linear(model)
+    children = np.arange(1, 21)
+    parents = JSON21_PARENTS[children]
+    bone_base = (base[children] - base[parents]) * 1000.0
+    bone_dirs = (dirs[children] - dirs[parents]) * 1000.0
+    target = np.asarray(target_lengths, dtype=np.float64).reshape(20) * 1000.0
+    count = bone_dirs.shape[2]
+    beta = np.zeros(count, dtype=np.float64)
+    for _ in range(iterations):
+        bones = bone_base + bone_dirs @ beta
+        lengths = np.maximum(np.linalg.norm(bones, axis=1), 1e-9)
+        jacobian = np.einsum("bc,bck->bk", bones, bone_dirs) / lengths[:, None]
+        hessian = jacobian.T @ jacobian + prior * np.eye(count)
+        gradient = jacobian.T @ (lengths - target) + prior * beta
+        updated = np.clip(beta - np.linalg.solve(hessian, gradient), -bound, bound)
+        converged = np.max(np.abs(updated - beta)) < 1e-9
+        beta = updated
+        if converged:
+            break
+    return beta
 
 
 def _load_standard_hand_model(path: Path) -> dict[str, np.ndarray]:
@@ -243,6 +307,25 @@ class HandSurfaceAssets:
 
     def faces(self, side: str) -> np.ndarray:
         return self.models[side]["faces"]
+
+    @staticmethod
+    def present(asset_dir: Path) -> bool:
+        standard = (asset_dir / "HAND_LEFT.pkl", asset_dir / "HAND_RIGHT.pkl")
+        legacy = (asset_dir / "MANO_LEFT.pkl", asset_dir / "MANO_RIGHT.pkl", asset_dir / "mano_runtime.npz")
+        return all(path.is_file() for path in standard) or all(path.is_file() for path in legacy)
+
+    def fit_shape(self, side: str, joints: np.ndarray) -> np.ndarray:
+        """One clip-wide beta for ``joints`` [T,21,3] (any rigid frame; NaN rows ignored).
+
+        The median bone length over the finite frames is matched; with fewer
+        than SHAPE_MIN_FRAMES such frames the mean shape (beta = 0) is used.
+        """
+        joints = np.asarray(joints, dtype=np.float64).reshape(-1, 21, 3)
+        finite = np.isfinite(joints).all(axis=(1, 2))
+        if finite.sum() < SHAPE_MIN_FRAMES:
+            return np.zeros(self.models[side]["shapedirs"].shape[2], dtype=np.float64)
+        lengths = np.median(_bone_lengths21(joints[finite]), axis=0)
+        return fit_shape_to_bone_lengths(self.models[side], lengths)
 
 
 def _camera_coordinates(points_world: np.ndarray, pose: np.ndarray) -> np.ndarray:
@@ -1099,7 +1182,9 @@ def _subtitle_for_frame(rows: list[dict], frame_index: int, cursor: int, *, cosm
     return "", narrative, cursor
 
 
-def _load_document(path: Path, camera_path: Path | None = None) -> tuple[dict, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray]:
+def _load_document(path: Path, camera_path: Path | None = None,
+                   fit_shape=None) -> tuple[dict, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray]:
+    """Load a DAG or Cosmos document; ``fit_shape(side, joints)`` adds Cosmos shapes when given."""
     document = json.loads(path.read_text(encoding="utf-8"))
     schema = document.get("schema")
     if schema in ("cosmos-e2e-result/v1", "cosmos-e2e-result/v2"):
@@ -1120,7 +1205,7 @@ def _load_document(path: Path, camera_path: Path | None = None) -> tuple[dict, n
                 CosmosE2EHeadDocument = module.CosmosE2EHeadDocument
         camera = json.loads(camera_path.read_text(encoding="utf-8")) if camera_path is not None else None
         converter = CosmosE2EDocument if schema == "cosmos-e2e-result/v1" else CosmosE2EHeadDocument
-        document = converter.convert(document, camera)
+        document = converter.convert(document, camera, fit_shape=fit_shape)
     elif camera_path is not None:
         raise SystemExit("--camera is only supported for Cosmos e2e JSON")
     metadata = document["Metadata"]
@@ -1431,10 +1516,16 @@ def main() -> int:
         if world_up.shape != (3,) or not np.isfinite(world_up).all() or np.linalg.norm(world_up) < 1e-9:
             raise SystemExit("--world-up must be a finite non-zero 'x,y,z' vector")
 
-    document, intrinsic, poses, joints, joints_px, betas, pose_valid = _load_document(args.annotation_json, args.camera)
+    # Cosmos results carry joints but no shape: with hand assets on hand the
+    # converter fits one beta per side from the clip, otherwise it stays None
+    # and both panes draw the measured skeletons.
+    assets = HandSurfaceAssets(args.mano_dir) if HandSurfaceAssets.present(args.mano_dir) else None
+    document, intrinsic, poses, joints, joints_px, betas, pose_valid = _load_document(
+        args.annotation_json, args.camera, fit_shape=assets.fit_shape if assets is not None else None)
     frame_count = int(document["Metadata"]["帧数"])
     subtitles = document.get("字幕", [])
-    assets = _load_assets_if_needed(args.mano_dir, joints, betas)
+    if assets is None:
+        assets = _load_assets_if_needed(args.mano_dir, joints, betas)
 
     try:
         video_path, downloaded_video_dir = _download_video_address(args.video)
