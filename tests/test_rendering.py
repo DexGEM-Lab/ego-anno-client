@@ -1798,7 +1798,16 @@ class HandAssetDependencyTests(unittest.TestCase):
         import sys, types
         module = types.ModuleType("scipy.sparse._csc"); module.csc_matrix = FakeCsc
         saved = {k: sys.modules.get(k) for k in ("scipy", "scipy.sparse", "scipy.sparse._csc")}
-        sys.modules["scipy.sparse._csc"] = module
+        # Pickle imports the parent packages too; synthesize the whole hierarchy
+        # so generating the fixture does not itself require an installed scipy.
+        scipy_module = types.ModuleType("scipy")
+        scipy_module.__path__ = []
+        sparse_module = types.ModuleType("scipy.sparse")
+        sparse_module.__path__ = []
+        scipy_module.sparse = sparse_module
+        sparse_module._csc = module
+        sys.modules.update({"scipy": scipy_module, "scipy.sparse": sparse_module,
+                            "scipy.sparse._csc": module})
         try:
             blob = pickle.dumps({"J_regressor": value}, protocol=2)
         finally:
