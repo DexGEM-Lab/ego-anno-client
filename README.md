@@ -38,7 +38,9 @@ On Windows, use `.venv\\Scripts\\python.exe` and `.venv\\Scripts\\ego-anno.exe`.
 If known, add `--camera ./camera.json` to **submit**; the client saves its
 rescaled calibration for render automatically. Without calibration the MP4
 shows the source video and predicted 3D skeleton/trajectory, but does **not**
-invent a source-video projection. Without beta, no MANO mesh is rendered.
+invent a source-video projection. Add `--mano-dir` (licensed hand model, see
+[section 6](#6-render-results-offline)) to draw MANO hand surfaces instead of
+skeletons.
 
 Success means: the job is `succeeded`, downloaded JSON has schema
 `cosmos-e2e-result/v2` with `num_frames - 1` rows of 156 finite action values,
@@ -254,6 +256,7 @@ job costs no rendering time. Render locally when you want a video:
 | --- | --- |
 | A `dag` result and the exact video you submitted | `ego-anno render --result annotation.json --video clip.mp4 -o preview.mp4` |
 | An `e2e` result and its saved inputs | `ego-anno render --result annotation.json --inputs ./run/inputs -o preview.mp4` |
+| Either, plus the licensed MANO model | add `--mano-dir /path/to/hand_model` to draw hand surfaces |
 
 Install with the `[render]` extra (see
 [section 1](#1-download-and-install-the-client)). The package contains the
@@ -324,9 +327,17 @@ dimensions must match. The original temporary video is deleted without
 The preview keeps all N video frames. I0 has no hand prediction; action row k
 is shown on I(k+1). Translations/joints are already physical meters and are
 not inverse-normalized again. Camera motion is integrated with I0 as world
-origin. Hand visibility/object classes and MANO beta are not inferred.
+origin. Hand visibility/object classes are not inferred.
 The command writes H.264/yuv420p/faststart MP4 atomically and preserves an
 existing output if rendering fails. It does not overwrite bundle inputs.
+
+An `e2e` result carries predicted joints but no hand shape. With `--mano-dir`
+(the same licensed assets as for `dag` results) one MANO shape per hand is
+fitted to the clip: the rest-pose bone lengths are matched by least squares to
+the median predicted bone lengths over the clip (|beta| <= 3, mean shape when
+fewer than three frames carry the hand), and the surface is posed on the
+predicted joints exactly as for a `dag` result. Without `--mano-dir` both
+panes draw the predicted 21-joint skeletons.
 
 The renderer snapshot's source commit/hashes are recorded in the installed
 `ego_anno/rendering/provenance.json`; this is provenance, not a runtime download.

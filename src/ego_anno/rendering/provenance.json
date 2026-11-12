@@ -2,17 +2,17 @@
   "schema": "ego-anno-renderer-provenance/v1",
   "source_repository": "DexGEM-Lab/ego-compute",
   "source_commit": "2ba840be88c383a0c2b69903853f6b990dc51785",
-  "snapshot_policy": "The two Python files derive from byte-for-byte source snapshots; cosmos_e2e.py additionally carries the local cosmos-e2e-result/v2 converter and render_ego_json_overlay.py the matching schema dispatch added with client 0.5.0. No runtime checkout, model weights, fonts, videos, fixtures, or other source assets are included or required for Cosmos skeleton rendering.",
+  "snapshot_policy": "The two Python files derive from byte-for-byte source snapshots; cosmos_e2e.py additionally carries the local cosmos-e2e-result/v2 converter and the optional clip-wide hand-shape fit hook, and render_ego_json_overlay.py the matching schema dispatch added with client 0.5.0 plus the bone-length shape fit used for Cosmos surfaces. No runtime checkout, model weights, fonts, videos, fixtures, or other source assets are included or required for Cosmos skeleton rendering.",
   "files": [
     {
       "source_path": "clusters/py312/render/src/render_pack/render_ego_json_overlay.py",
       "vendored_path": "render_ego_json_overlay.py",
-      "sha256": "475b5099e7db8e7f1c19b002a1181c59cd784e3b386756a837644f64fd681152"
+      "sha256": "e9dfa6148acef176f82a55113b3aca2e93810f252fb507de2f201050d47ff832"
     },
     {
       "source_path": "clusters/py312/render/src/render_pack/cosmos_e2e.py",
       "vendored_path": "cosmos_e2e.py",
-      "sha256": "d328be2156f5eb65228828074119aaf35a25a88e373c6b06206e1bce80841386"
+      "sha256": "ddffc1568d97171d98cd200f85f4e05915841e70a86f1bab6e49bf3d39e96319"
     }
   ]
 }
