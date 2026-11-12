@@ -58,7 +58,7 @@ _ANCHOR_DEADBAND_M = 0.05
 _HEADING_DEADBAND_DEG = 15.0
 _OBSERVER_MAX_SPEED = 0.6
 # Assumed head pitch (deg, forward-down) when the clip's yaw spread cannot
-# pin world-up: the EgoDex median measured on the source recordings.
+# pin world-up: a typical measured value for head-mounted tabletop recordings.
 _FALLBACK_HEAD_PITCH_DEG = 22.0
 _FLOOR_DROP_M = 0.75
 GRID_COLOR = (91, 89, 83)                     # sampled bright grid core, BGR
@@ -131,6 +131,30 @@ class _LegacyArrayStub:
     """Local placeholder for legacy chumpy wrappers in the hand pickles."""
 
 
+class _CscMatrixStub:
+    """numpy-only stand-in for the scipy ``csc_matrix`` stored in the hand pickles.
+
+    The render extra ships numpy and OpenCV only. The standard hand assets keep
+    ``J_regressor`` as a compressed-sparse-column matrix, so unpickling it with
+    the real class would make scipy a hidden hard dependency of ``--mano-dir``.
+    This stub accepts the pickled state and rebuilds the same dense array.
+    """
+
+    def __setstate__(self, state):
+        self.__dict__.update(state if isinstance(state, dict) else {})
+
+    def toarray(self) -> np.ndarray:
+        shape = tuple(int(v) for v in (self.__dict__.get("_shape") or self.__dict__["shape"]))
+        data = np.asarray(self.__dict__["data"], dtype=np.float64)
+        indices = np.asarray(self.__dict__["indices"], dtype=np.int64)
+        indptr = np.asarray(self.__dict__["indptr"], dtype=np.int64)
+        dense = np.zeros(shape, dtype=np.float64)
+        for column in range(shape[1]):
+            start, end = indptr[column], indptr[column + 1]
+            dense[indices[start:end], column] = data[start:end]
+        return dense
+
+
 class _HandModelUnpickler(pickle.Unpickler):
     """Load only the numpy/scipy globals needed by the standard hand assets."""
 
@@ -154,6 +178,8 @@ class _HandModelUnpickler(pickle.Unpickler):
             raise pickle.UnpicklingError(f"unsupported pickle global in hand asset: {module}.{name}")
         if (module, name) in (("chumpy.ch", "Ch"), ("chumpy.reordering", "Select")):
             return _LegacyArrayStub
+        if module.startswith("scipy.sparse"):
+            return _CscMatrixStub
         return super().find_class(module, name)
 
 

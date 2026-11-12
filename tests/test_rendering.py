@@ -1777,3 +1777,36 @@ class InProcessRendererTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HandAssetDependencyTests(unittest.TestCase):
+    def test_sparse_regressor_unpickles_without_scipy(self):
+        """The render extra is numpy+OpenCV only; a pickled scipy csc_matrix must
+        load through the numpy stand-in and rebuild the same dense matrix."""
+        import pickle
+        import numpy as np
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+
+        class FakeCsc:  # pickles like scipy: module scipy.sparse._csc, class csc_matrix
+            pass
+        FakeCsc.__module__ = "scipy.sparse._csc"
+        FakeCsc.__qualname__ = FakeCsc.__name__ = "csc_matrix"
+        dense = np.array([[1.0, 0.0, 2.0], [0.0, 3.0, 0.0]])
+        value = FakeCsc()
+        value.__dict__.update({"data": [1.0, 3.0, 2.0], "indices": [0, 1, 0],
+                               "indptr": [0, 1, 2, 3], "_shape": (2, 3)})
+        import sys, types
+        module = types.ModuleType("scipy.sparse._csc"); module.csc_matrix = FakeCsc
+        saved = {k: sys.modules.get(k) for k in ("scipy", "scipy.sparse", "scipy.sparse._csc")}
+        sys.modules["scipy.sparse._csc"] = module
+        try:
+            blob = pickle.dumps({"J_regressor": value}, protocol=2)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        import io
+        loaded = renderer._HandModelUnpickler(io.BytesIO(blob), encoding="latin1").load()["J_regressor"]
+        np.testing.assert_array_equal(loaded.toarray(), dense)
