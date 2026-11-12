@@ -362,7 +362,8 @@ def _ip(p):
 class _Raster:
     """Draws on a supersampled canvas; text is placed in final-pane pixels times SS."""
 
-    def __init__(self, width, height, box_lo, box_hi, centre, facing, azim_deg=40.0, elev_deg=22.0):
+    def __init__(self, width, height, box_lo, box_hi, centre, facing, azim_deg=40.0, elev_deg=22.0,
+                 content=None):
         self.W, self.H = int(width), int(height)
         self.s = min(self.W / REF_PANE[0], self.H / REF_PANE[1])
         ss = SS
@@ -374,6 +375,8 @@ class _Raster:
         lo = self.lo - np.asarray((0.05, 0.05, 0.0))
         hi = self.hi + np.asarray((0.0, 0.0, 0.15))
         corners = np.asarray([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+        if content is not None and len(content):
+            corners = np.vstack([corners, content])
         x0, x1 = 50 * self.s * ss, (self.W - 20 * self.s) * ss
         y0, y1 = 120 * self.s * ss, (self.H - 10 * self.s) * ss
         c = np.asarray(centre, float)
@@ -558,16 +561,16 @@ class BodyPane:
         ctr = np.median(pts, axis=0)
         cx, cy = round(ctr[0] * 4) / 4, round(ctr[1] * 4) / 4
         facing = nrm(self.body.fwd.mean(axis=0), (0.0, 1.0, 0.0))
-        # Grid box: 0.9 m square around the upper body, widened (0.05 m steps) only as
-        # far as the annotated hands reach, so a hand beyond the arm stays in view.
+        # Grid box: a 0.9 m metric reference around the upper body (its bottom just below
+        # the lowest pelvis, so it is not a floor). The observer is fitted to the box AND
+        # every annotated hand joint, so a hand the arm cannot reach stays in view.
         hand_pts = [self.p(np.asarray(rows, dtype=np.float64).reshape(-1, 3)) for rows in joints]
         hand_pts = np.vstack([h[np.isfinite(h).all(axis=1)] for h in hand_pts] + [pts])
-        hb = max(0.45, math.ceil((np.abs(hand_pts[:, :2] - (cx, cy)).max() + 0.05) / 0.05) * 0.05)
-        zbot = math.floor((min(min(j["pelvis"][2] for j in self.body.J), hand_pts[:, 2].min()) - 0.15)
-                          / 0.2) * 0.2
+        hb = 0.45
+        zbot = math.floor((min(j["pelvis"][2] for j in self.body.J) - 0.15) / 0.2) * 0.2
         ztop = math.ceil((max(j["head"][2] for j in self.body.J) + 0.25) / 0.2) * 0.2
         self.raster = _Raster(self.width, self.height, (cx - hb, cy - hb, zbot), (cx + hb, cy + hb, ztop),
-                              (cx, cy, 0.5 * (zbot + ztop)), facing)
+                              (cx, cy, 0.5 * (zbot + ztop)), facing, content=hand_pts)
 
     def p(self, pts):
         """Product-world points -> display world."""
