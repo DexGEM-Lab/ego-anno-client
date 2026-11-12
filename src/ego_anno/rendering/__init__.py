@@ -178,6 +178,7 @@ def render_result(result, inputs, output, width=None, height=None, mano_dir=None
         submission_path = inputs_path / "submission.json"
         protected = [result_path, video_path.resolve(), camera_path.resolve(), submission_path.resolve()]
         _refuse_collision(destination, protected)
+        extra = [] if mano_dir is None else ["--mano-dir", str(_check_mano_dir(mano_dir))]
         document = _read_object(result_path, "result")
         if document.get("schema") not in COSMOS_SCHEMAS:
             raise ClientError("offline rendering of a saved bundle only accepts {}; ".format(
@@ -187,7 +188,6 @@ def render_result(result, inputs, output, width=None, height=None, mano_dir=None
         expected_size = _validate_submission(submission, document, camera)
         if not video_path.is_file():
             raise ClientError("saved processed input video does not exist: {}".format(video_path))
-        extra = [] if mano_dir is None else ["--mano-dir", str(_check_mano_dir(mano_dir))]
         output_size = _check_output_dimensions(width, height, expected_size)
         if shutil.which("ffmpeg") is None:
             raise ClientError("offline rendering requires system ffmpeg with the libx264 encoder on PATH")

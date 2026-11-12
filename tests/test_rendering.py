@@ -445,6 +445,39 @@ class CosmosHeadDocumentTests(unittest.TestCase):
         self.assertIsNone(without["逐帧轨迹"][1]["帧2"]["手0"]["手部21点投影坐标"])
         self.assertIsNone(without["Metadata"]["相机内参"])
 
+    def test_shape_fitter_output_fills_every_predicted_frame(self):
+        """A clip-wide shape is written to beta参数 wherever a hand is predicted."""
+        from ego_anno.rendering.cosmos_e2e import CosmosE2EDocument
+        seen = {}
+
+        def fit_shape(side, joints):
+            seen[side] = self.np.asarray(joints)
+            return self.np.full(10, 0.5 if side == "left" else -0.25)
+
+        for converter, result in ((self.converter, physical_result_v2(4)), (CosmosE2EDocument, physical_result(4))):
+            with self.subTest(schema=result["schema"]):
+                seen.clear()
+                document = converter.convert(result, fit_shape=fit_shape)
+                self.assertEqual(set(seen), {"left", "right"})
+                for side in ("left", "right"):
+                    self.assertEqual(seen[side].shape, (3, 21, 3))
+                    self.assertTrue(self.np.isfinite(seen[side]).all())
+                frames = document["逐帧轨迹"]
+                self.assertIsNone(frames[0]["帧1"]["手0"])
+                for index in range(1, 4):
+                    frame = frames[index]["帧{}".format(index + 1)]
+                    self.assertEqual(frame["手0"]["beta参数"], [0.5] * 10)
+                    self.assertEqual(frame["手1"]["beta参数"], [-0.25] * 10)
+                    self.assertTrue(all(self.np.isfinite(frame[key]["beta参数"]).all() for key in ("手0", "手1")))
+                json.dumps(document, allow_nan=False)
+        # Without a fitter nothing is invented.
+        plain = self.converter.convert(physical_result_v2(3))
+        self.assertIsNone(plain["逐帧轨迹"][1]["帧2"]["手0"]["beta参数"])
+        with self.assertRaisesRegex(ValueError, "10 finite values"):
+            self.converter.convert(physical_result_v2(3), fit_shape=lambda side, joints: self.np.full(10, float("nan")))
+        with self.assertRaisesRegex(ValueError, "10 finite values"):
+            self.converter.convert(physical_result_v2(3), fit_shape=lambda side, joints: self.np.zeros(9))
+
     def test_malformed_v2_results_are_rejected(self):
         cases = []
         bad = physical_result_v2(); bad["schema"] = "cosmos-e2e-result/v1"
@@ -470,6 +503,95 @@ class CosmosHeadDocumentTests(unittest.TestCase):
         for result, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 self.converter.convert(result)
+
+
+@unittest.skipUnless(importlib.util.find_spec("numpy") is not None, "numpy (render extra) not installed")
+class HandShapeFitTests(unittest.TestCase):
+    """The clip-wide shape fit on a synthetic hand model (no licensed assets)."""
+
+    def setUp(self):
+        import numpy as np
+        self.np = np
+        self.renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        rng = np.random.default_rng(7)
+        # 778 vertices like MANO so the tip vertex indices reconstruct uses exist;
+        # each kinematic joint regresses a few nearby vertices.
+        vertices = rng.uniform(-0.05, 0.05, (778, 3))
+        regressor = np.zeros((16, 778))
+        for joint in range(16):
+            picked = rng.choice(778, 4, replace=False)
+            regressor[joint, picked] = 0.25
+        self.model = {
+            "v_template": vertices,
+            "shapedirs": rng.normal(0.0, 0.004, (778, 3, 10)),
+            "J_regressor": regressor,
+            "weights": np.eye(16)[rng.integers(0, 16, 778)],
+            "faces": np.zeros((0, 3), dtype=np.int32),
+        }
+        self.assets = self.renderer.HandSurfaceAssets.__new__(self.renderer.HandSurfaceAssets)
+        self.assets.models = {"left": self.model, "right": self.model}
+        self.assets._shape_cache = {}
+
+    def rest_joints(self, beta):
+        base, dirs = self.renderer._rest_joints21_linear(self.model)
+        return base + dirs @ beta
+
+    def test_rest_joints_are_the_reconstruct_targets(self):
+        """The fitted skeleton is the one reconstruct spans: regressor joints plus tip vertices."""
+        np = self.np
+        beta = np.linspace(-1.0, 1.0, 10)
+        vertices, joints16 = self.assets.shaped("left", beta)
+        rest = self.rest_joints(beta)
+        self.assertTrue(np.allclose(rest[self.renderer.MANO16_TO_JSON21], joints16))
+        for tip_vertex, tip_joint in self.renderer.DISTAL_TIPS.values():
+            self.assertTrue(np.allclose(rest[tip_joint], vertices[tip_vertex]))
+
+    def test_bone_length_fit_recovers_the_shape_from_posed_frames(self):
+        np = self.np
+        rng = np.random.default_rng(3)
+        truth = rng.uniform(-2.0, 2.0, 10)
+        rest = self.rest_joints(truth)
+        frames = []
+        for _ in range(12):
+            axis = rng.normal(size=3)
+            axis /= np.linalg.norm(axis)
+            angle = rng.uniform(0, np.pi)
+            k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+            rotation = np.eye(3) + np.sin(angle) * k + (1 - np.cos(angle)) * k @ k
+            frames.append(rest @ rotation.T + rng.normal(size=3))
+        frames.append(np.full((21, 3), np.nan))  # an absent frame is ignored
+        fitted = self.assets.fit_shape("right", np.asarray(frames))
+        self.assertEqual(fitted.shape, (10,))
+        self.assertTrue(np.isfinite(fitted).all())
+        self.assertLess(np.abs(fitted - truth).max(), 0.05, (fitted, truth))
+        fitted_lengths = self.renderer._bone_lengths21(self.rest_joints(fitted))
+        # The damping prior leaves a sub-millimetre bias on the bone lengths.
+        self.assertLess(np.abs(fitted_lengths - self.renderer._bone_lengths21(rest)).max(), 5e-4)
+
+    def test_fit_is_bounded_and_falls_back_to_the_mean_shape(self):
+        np = self.np
+        rest = self.rest_joints(np.zeros(10))
+        self.assertTrue(np.array_equal(self.assets.fit_shape("left", np.stack([rest, rest])), np.zeros(10)))
+        self.assertTrue(np.array_equal(self.assets.fit_shape("left", np.full((5, 21, 3), np.nan)), np.zeros(10)))
+        huge = self.renderer.fit_shape_to_bone_lengths(self.model, 50.0 * self.renderer._bone_lengths21(rest))
+        self.assertTrue(np.isfinite(huge).all())
+        self.assertLessEqual(np.abs(huge).max(), self.renderer.SHAPE_BOUND)
+        self.assertGreater(np.abs(huge).max(), 1.0)
+
+    def test_cosmos_document_carries_the_fitted_shape_only_with_assets(self):
+        np = self.np
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "result.json"
+            path.write_text(json.dumps(physical_result_v2(5), allow_nan=False), encoding="utf-8")
+            _, _, _, joints, _, betas, _ = self.renderer._load_document(path)
+            self.assertTrue(np.isnan(betas[0]).all() and np.isnan(betas[1]).all())
+            self.assertIsNone(self.renderer._load_assets_if_needed(Path(temporary) / "absent", joints, betas))
+            _, _, _, joints, _, betas, _ = self.renderer._load_document(path, fit_shape=self.assets.fit_shape)
+            for side in range(2):
+                self.assertTrue(np.isnan(betas[side][0]).all())
+                self.assertTrue(np.isfinite(betas[side][1:]).all())
+                self.assertTrue((betas[side][1:] == betas[side][1]).all())
+            self.assertFalse(self.renderer.HandSurfaceAssets.present(Path(temporary)))
 
 
 class DagResultTests(unittest.TestCase):
@@ -1010,6 +1132,20 @@ class DagResultTests(unittest.TestCase):
             cli.main(base + ["--inputs", "bundle", "--fps", "15"])
         with self.assertRaises(SystemExit):
             cli.main(base + ["--inputs", "bundle", "--world-up", "0,-1,0"])
+
+    def test_mano_dir_is_accepted_with_a_saved_bundle(self):
+        from ego_anno import cli
+        with mock.patch.object(rendering, "render_result", return_value=Path("out.mp4")) as render_result:
+            self.assertEqual(cli.main(["render", "--result", "r.json", "--inputs", "bundle",
+                                       "--mano-dir", "assets", "-o", "out.mp4"]), 0)
+        render_result.assert_called_once_with("r.json", "bundle", "out.mp4", None, None, mano_dir="assets")
+        with mock.patch.object(rendering, "render_result", return_value=Path("out.mp4")) as render_result:
+            self.assertEqual(cli.main(["render", "--result", "r.json", "--inputs", "bundle", "-o", "out.mp4"]), 0)
+        render_result.assert_called_once_with("r.json", "bundle", "out.mp4", None, None, mano_dir=None)
+        self.video.write_bytes(b"placeholder")
+        with self.assertRaisesRegex(ClientError, "does not exist"):
+            rendering.render_result(self.result, self.root, self.output, mano_dir=str(self.root / "absent"))
+        self.assertFalse(self.output.exists())
 
     def test_world_up_is_validated_and_forwarded_to_the_renderer(self):
         self.assertEqual(rendering._world_up_argument(None), [])
