@@ -226,16 +226,17 @@ class UpperBody:
         c7 = H - NECK_LEN * n_neck
         d_tr = math.cos(lean) * UPZ + math.sin(lean) * f          # pelvis -> shoulder axis
         shoulder = c7 - 0.03 * d_tr
-        pelvis = shoulder - SPINE_LEN * d_tr
-        pts, p, cum, total = [], pelvis, 0.0, sum(SPINE)
-        for L in SPINE:                                          # lumbar more upright
+        # Spine segments of fixed length, lumbar more upright than thoracic, hung from
+        # the shoulders: the pelvis is wherever the chain ends, so no bone stretches.
+        total, cum, steps = sum(SPINE), 0.0, []
+        for L in SPINE:
             cum += L
             a = lean * (0.45 + 0.55 * cum / total)
-            p = p + (L / total) * SPINE_LEN * (math.cos(a) * UPZ + math.sin(a) * f)
-            pts.append(p)
-        err = shoulder - pts[-1]                                 # close the chain evenly
-        pts = [q + err * (j + 1) / len(pts) for j, q in enumerate(pts)]
-        return {"head": C, "neck_top": H, "c7": c7, "sh_c": shoulder, "spine": pts[:-1],
+            steps.append((L / total) * SPINE_LEN * (math.cos(a) * UPZ + math.sin(a) * f))
+        pelvis = shoulder - np.sum(steps, axis=0)
+        # spine0 is the vertebra under the shoulders, spine2 the one above the pelvis
+        spine = list(pelvis + np.cumsum(steps, axis=0)[:-1])[::-1]
+        return {"head": C, "neck_top": H, "c7": c7, "sh_c": shoulder, "spine": spine,
                 "pelvis": pelvis, "hip_left": pelvis + HIP_HALF * lat,
                 "hip_right": pelvis - HIP_HALF * lat, "gap": {}, "pro": {"left": 0.0, "right": 0.0},
                 "lean": lean}
