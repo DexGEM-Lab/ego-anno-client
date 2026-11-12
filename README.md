@@ -259,6 +259,7 @@ job costs no rendering time. Render locally when you want a video:
 | A `dag` result and the exact video you submitted | `ego-anno render --result annotation.json --video clip.mp4 -o preview.mp4` |
 | An `e2e` result and its saved inputs | `ego-anno render --result annotation.json --inputs ./run/inputs -o preview.mp4` |
 | Either, plus the licensed MANO model | add `--mano-dir /path/to/hand_model` to draw hand surfaces |
+| Either, plus an AR label sidecar | add `--labels ./labels.json` to draw the time-synced AR segments |
 
 Install with the `[render]` extra (see
 [section 1](#1-download-and-install-the-client)). The package contains the
@@ -266,6 +267,19 @@ renderer and physical-action decoder; no private repository, GPU, API key, or
 network connection is needed to render. System FFmpeg with libx264 is required. The output is H.264/yuv420p/faststart and is published
 atomically: rendering never overwrites the result, the video, or an existing
 destination.
+
+### AR label overlay
+
+`--labels` accepts an `ego-anno-ar-labels/v1` sidecar: normalized WGO segments
+(`start_sec`/`end_sec`/`subtask`) on the rendered video's own timeline. Each
+segment's text is drawn in the caption band for the frames whose presentation
+time falls in its half-open `[start_sec, end_sec)` interval; gaps render
+blank, parallel segments draw one line each, long text wraps, and the words
+are never rewritten. The sidecar's `input_sha256` must equal the rendered
+video's bytes, so labels produced for any other clip are refused rather than
+approximately matched. Without `--labels` the band carries an explicit
+"AR labels: not provided" notice — the renderer never fabricates label text
+from other fields.
 
 ### dag results
 
