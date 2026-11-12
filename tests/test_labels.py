@@ -99,14 +99,22 @@ class SidecarTests(unittest.TestCase):
                                ensure_ascii=False, allow_nan=False).encode("utf-8")
         self.assertEqual(labels.content_sha256(segments), hashlib.sha256(canonical).hexdigest())
 
+    def test_additive_envelope_fields_are_tolerated(self):
+        document = sidecar(job_id="9ddb3966-6e40-4c45-81a7-b6c35f18edf9",
+                           labeling_sha256=sidecar()["content_sha256"],
+                           quality_state="held", quality_reason="review pending")
+        checked = labels.validate_sidecar(document)
+        self.assertEqual(checked["content_sha256"], sidecar()["content_sha256"])
+
+    def test_envelope_labeling_sha_must_match_segments(self):
+        document = sidecar(labeling_sha256="b" * 64)
+        with self.assertRaisesRegex(ValueError, "labeling_sha256 does not match"):
+            labels.validate_sidecar(document)
+
     def test_content_mismatch_is_rejected(self):
         document = sidecar(content_sha256="b" * 64)
         with self.assertRaisesRegex(ValueError, "content_sha256 does not match"):
             labels.validate_sidecar(document)
-
-    def test_unknown_fields_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "unknown fields"):
-            labels.validate_sidecar(sidecar(extra_field=1))
 
     def test_timebase_is_validated(self):
         with self.assertRaisesRegex(ValueError, "timebase.clock"):
@@ -118,6 +126,10 @@ class SidecarTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "timebase.fps"):
             labels.validate_sidecar(sidecar(timebase={"clock": "uploaded_video_seconds",
                                                       "origin": "first_frame_pts", "half_open": True, "fps": 0}))
+        with self.assertRaisesRegex(ValueError, "exactly"):
+            labels.validate_sidecar(sidecar(timebase={"clock": "uploaded_video_seconds",
+                                                      "origin": "first_frame_pts", "half_open": True,
+                                                      "fps": 15, "duration_sec": 143}))
 
     def test_target_is_null_or_hex(self):
         checked = labels.validate_sidecar(sidecar(target_identity_sha256="c" * 64))

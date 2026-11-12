@@ -32,6 +32,11 @@ SEGMENT_KEYS = ("start_sec", "end_sec", "subtask")
 TIMEBASE = {"clock": "uploaded_video_seconds", "origin": "first_frame_pts", "half_open": True}
 RENDER_IDENTITY_SCHEMA = "anneal-labeled-render/v1"
 RENDER_RECIPE_VERSION = 1
+# Frozen with the backend: the recipe this renderer implements and the SDK
+# version string the render identity pins. The render worker imports both
+# from here so there is exactly one source.
+RENDERER_RECIPE_ID = "egodex-render/0.6.0-joint-labels/v1"
+RENDERER_VERSION = "0.6.0"
 
 
 def _canonical(payload):
@@ -139,10 +144,11 @@ def validate_sidecar(document):
     target = document.get("target_identity_sha256")
     if target is not None:
         target = _sha256_field(target, "target_identity_sha256")
-    extra = set(document) - {"schema", "content_sha256", "canonical_input_id", "input_sha256",
-                             "timebase", "target_identity_sha256", "segments"}
-    if extra:
-        raise ValueError("labels sidecar carries unknown fields: {}".format(sorted(extra)))
+    # The served envelope may carry additive metadata (job_id,
+    # labeling_sha256, quality_state, quality_reason); only the required
+    # subset is validated, additive fields are tolerated.
+    if "labeling_sha256" in document and document["labeling_sha256"] != declared:
+        raise ValueError("envelope labeling_sha256 does not match its segments")
     return {"segments": segments, "content_sha256": declared,
             "canonical_input_id": canonical_input_id.strip(), "input_sha256": input_sha256,
             "timebase": timebase, "target_identity_sha256": target}
