@@ -558,9 +558,14 @@ class BodyPane:
         ctr = np.median(pts, axis=0)
         cx, cy = round(ctr[0] * 4) / 4, round(ctr[1] * 4) / 4
         facing = nrm(self.body.fwd.mean(axis=0), (0.0, 1.0, 0.0))
-        zbot = math.floor((min(j["pelvis"][2] for j in self.body.J) - 0.15) / 0.2) * 0.2
+        # Grid box: 0.9 m square around the upper body, widened (0.05 m steps) only as
+        # far as the annotated hands reach, so a hand beyond the arm stays in view.
+        hand_pts = [self.p(np.asarray(rows, dtype=np.float64).reshape(-1, 3)) for rows in joints]
+        hand_pts = np.vstack([h[np.isfinite(h).all(axis=1)] for h in hand_pts] + [pts])
+        hb = max(0.45, math.ceil((np.abs(hand_pts[:, :2] - (cx, cy)).max() + 0.05) / 0.05) * 0.05)
+        zbot = math.floor((min(min(j["pelvis"][2] for j in self.body.J), hand_pts[:, 2].min()) - 0.15)
+                          / 0.2) * 0.2
         ztop = math.ceil((max(j["head"][2] for j in self.body.J) + 0.25) / 0.2) * 0.2
-        hb = 0.45
         self.raster = _Raster(self.width, self.height, (cx - hb, cy - hb, zbot), (cx + hb, cy + hb, ztop),
                               (cx, cy, 0.5 * (zbot + ztop)), facing)
 
