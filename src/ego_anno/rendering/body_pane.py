@@ -22,7 +22,8 @@ front-oblique camera solved once for the whole clip. numpy + OpenCV only.
 Coordinates: the *product world* is the result's world frame (first camera frame).
 The *display world* is right-handed with z = world-up, y = the clip's mean horizontal
 gaze and the median head height at z = HEAD_HEIGHT_M (an assumed EgoDex median; the
-result carries no floor), so the grid's Z labels are nominal heights.
+result carries no floor), lowered when the clip's highest head would otherwise exceed
+the rig's standing eye height, so the grid's Z labels are nominal heights.
 """
 from __future__ import annotations
 
@@ -47,6 +48,7 @@ LEAN_MAX = math.radians(15.0)         # thoracic lean cap
 NECK_MAX = math.radians(45.0)         # lower-cervical flexion cap
 REACH = 0.9995 * ARM                  # farther than this the arm is drawn straight
 HEAD_HEIGHT_M = 1.12                  # EgoDex median head height (display z of the median head)
+STANDING_EYE_M = 0.936 * STATURE_M    # no head is drawn higher than the rig's standing eye
 REFERENCE_FPS = 30.0                  # smoothing sigmas below are in frames at this rate
 
 UPZ = np.asarray((0.0, 0.0, 1.0))
@@ -161,8 +163,12 @@ def display_frame(poses, pose_valid, up):
         fw = seed - up * float(seed @ up)
     fw = nrm(fw)
     M = np.stack([np.cross(fw, up), fw, up])
-    centre = np.median(poses[valid, :3, 3], axis=0) if valid.any() else np.zeros(3)
-    offset = np.asarray((0.0, 0.0, HEAD_HEIGHT_M)) - M @ centre
+    centres = poses[valid, :3, 3] if valid.any() else np.zeros((1, 3))
+    heights = centres @ up
+    # median head at HEAD_HEIGHT_M, unless a clip that stands up from a crouch would put
+    # its highest head above standing eye height: then that head sets the level
+    lift = min(HEAD_HEIGHT_M - float(np.median(heights)), STANDING_EYE_M - float(heights.max()))
+    offset = M @ (-np.median(centres, axis=0)) * np.asarray((1.0, 1.0, 0.0)) + np.asarray((0.0, 0.0, lift))
     return M, offset
 
 
@@ -558,19 +564,21 @@ class BodyPane:
         self.body = UpperBody(centres, rotations, wrists, fps)
         named = [self.body.named(i) for i in range(self.n)]
         pts = np.asarray([p for frame in named for p in frame.values()])
-        ctr = np.median(pts, axis=0)
-        cx, cy = round(ctr[0] * 4) / 4, round(ctr[1] * 4) / 4
+        trunk = np.asarray([p for frame in named for k, p in frame.items() if not k.startswith(("elbow", "wrist"))])
         facing = nrm(self.body.fwd.mean(axis=0), (0.0, 1.0, 0.0))
-        # Grid box: a 0.9 m metric reference around the upper body (its bottom just below
-        # the lowest pelvis, so it is not a floor). The observer is fitted to the box AND
-        # every annotated hand joint, so a hand the arm cannot reach stays in view.
+        # Grid box: a metric reference around where the trunk goes during the clip, at
+        # least 0.9 m square, its bottom just below the lowest pelvis (it is not a
+        # floor). The observer is fitted to the box AND every arm and annotated hand
+        # joint, so a hand the arm cannot reach stays in view.
         hand_pts = [self.p(np.asarray(rows, dtype=np.float64).reshape(-1, 3)) for rows in joints]
-        hand_pts = np.vstack([h[np.isfinite(h).all(axis=1)] for h in hand_pts] + [pts])
-        hb = 0.45
+        content = np.vstack([h[np.isfinite(h).all(axis=1)] for h in hand_pts] + [pts])
+        lo_xy, hi_xy = trunk[:, :2].min(axis=0), trunk[:, :2].max(axis=0)
+        mid = np.round(0.5 * (lo_xy + hi_xy) / 0.05) * 0.05
+        half = np.maximum(0.45, np.ceil((0.5 * (hi_xy - lo_xy) + 0.05) / 0.05) * 0.05)
         zbot = math.floor((min(j["pelvis"][2] for j in self.body.J) - 0.15) / 0.2) * 0.2
         ztop = math.ceil((max(j["head"][2] for j in self.body.J) + 0.25) / 0.2) * 0.2
-        self.raster = _Raster(self.width, self.height, (cx - hb, cy - hb, zbot), (cx + hb, cy + hb, ztop),
-                              (cx, cy, 0.5 * (zbot + ztop)), facing, content=hand_pts)
+        self.raster = _Raster(self.width, self.height, (*(mid - half), zbot), (*(mid + half), ztop),
+                              (*mid, 0.5 * (zbot + ztop)), facing, content=content)
 
     def p(self, pts):
         """Product-world points -> display world."""
