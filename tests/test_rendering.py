@@ -225,7 +225,7 @@ import ego_anno.rendering
         provenance = json.loads((package / "provenance.json").read_text(encoding="utf-8"))
         self.assertTrue(provenance["source_commit"].startswith("2ba840b"))
         self.assertEqual({entry["vendored_path"] for entry in provenance["files"]},
-                         {"cosmos_e2e.py", "render_ego_json_overlay.py"})
+                         {"body_pane.py", "cosmos_e2e.py", "render_ego_json_overlay.py"})
         for entry in provenance["files"]:
             self.assertEqual(hashlib.sha256((package / entry["vendored_path"]).read_bytes()).hexdigest(),
                              entry["sha256"])
@@ -284,7 +284,7 @@ class RealOfflineRenderTests(BundleCase):
             destination = self.render()
         self.assertEqual(destination, self.output)
         stream = self.probe_output()
-        self.assertEqual([stream["width"], stream["height"]], [320, 240])
+        self.assertEqual([stream["width"], stream["height"]], [1920, 1080])
         self.assertEqual((self.inputs / "video.mp4").read_bytes(), original_video)
         self.assertEqual(self.result_path.read_bytes(), original_result)
         self.assertFalse(list(self.root.glob(".ego-anno-render-*")))
@@ -302,6 +302,11 @@ class RealOfflineRenderTests(BundleCase):
         self.save_json(self.result_path, physical_result_v2())
         destination = self.render()
         self.assertEqual(destination, self.output)
+        stream = self.probe_output()
+        self.assertEqual([stream["width"], stream["height"]], [1920, 1080])
+
+    def test_real_render_two_pane_keeps_the_source_size(self):
+        self.render(layout="two-pane")
         stream = self.probe_output()
         self.assertEqual([stream["width"], stream["height"]], [320, 240])
 
@@ -1070,7 +1075,8 @@ class DagRenderCase(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return json.loads(completed.stdout)["streams"][0]
 
-    def panes(self, path, frame_index=0):
+    def panes(self, path, frame_index=0, layout="three-pane"):
+        """(overlay, follow view[, skeleton]) pane crops of one decoded frame."""
         capture = self.cv2.VideoCapture(str(path))
         try:
             capture.set(self.cv2.CAP_PROP_POS_FRAMES, frame_index)
@@ -1079,9 +1085,18 @@ class DagRenderCase(unittest.TestCase):
             capture.release()
         self.assertTrue(ok, "cannot decode rendered frame {}".format(frame_index))
         height, width = frame.shape[:2]
+        if layout == "three-pane":
+            renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+            return tuple(frame[y:y + h, x:x + w]
+                         for x, y, w, h in renderer._three_pane_layout(width, height)["panes"])
         band = min(220, max(165, int(round(height * 0.145))))
         pane_height, pane_width = height - band, width // 2
         return frame[:pane_height, :pane_width], frame[:pane_height, pane_width:pane_width * 2]
+
+    def body_joint_pixels(self, pane):
+        """Pixels of the skeleton pane's orange body joints."""
+        numpy = __import__("numpy")
+        return int((abs(pane.astype(int) - numpy.array((50, 110, 240))).sum(axis=2) < 90).sum())
 
     def joint_pixels(self, pane):
         total = 0
@@ -1100,7 +1115,7 @@ class RealDagRenderTests(DagRenderCase):
         self.assertEqual(stream["codec_name"], "h264")
         self.assertEqual(stream["pix_fmt"], "yuv420p")
         self.assertEqual(int(stream["nb_read_frames"]), 3)
-        self.assertEqual([stream["width"], stream["height"]], [640, 480])
+        self.assertEqual([stream["width"], stream["height"]], [1920, 1080])
         numerator, denominator = map(int, stream["avg_frame_rate"].split("/"))
         self.assertAlmostEqual(numerator / denominator, 15)
         payload = self.output.read_bytes()
@@ -1108,9 +1123,23 @@ class RealDagRenderTests(DagRenderCase):
         self.assertEqual(self.result.read_bytes(), original_result)
         self.assertFalse(list(self.root.glob(".ego-anno-render-*")))
         for frame_index in range(3):
-            source_pane, world_pane = self.panes(self.output, frame_index)
+            source_pane, world_pane, body_pane = self.panes(self.output, frame_index)
             self.assertGreater(self.joint_pixels(source_pane), 0, "no joints over the source frame")
             self.assertGreater(self.joint_pixels(world_pane), 0, "no joints in the 3D pane")
+            self.assertGreater(self.body_joint_pixels(body_pane), 0, "no body joints in the skeleton pane")
+
+    def test_two_pane_layout_keeps_the_source_size_and_both_panes(self):
+        rendering.render_video_result(self.result, self.video, self.output, layout="two-pane")
+        stream = self.probe(self.output)
+        self.assertEqual([stream["width"], stream["height"]], [640, 480])
+        source_pane, world_pane = self.panes(self.output, 1, layout="two-pane")
+        self.assertGreater(self.joint_pixels(source_pane), 0)
+        self.assertGreater(self.joint_pixels(world_pane), 0)
+
+    def test_unknown_layout_is_rejected(self):
+        with self.assertRaisesRegex(ClientError, "--layout must be one of"):
+            rendering.render_video_result(self.result, self.video, self.output, layout="four-pane")
+        self.assertFalse(self.output.exists())
 
     def test_layout_override_is_honoured(self):
         rendering.render_video_result(self.result, self.video, self.output, width=1280, height=960)
@@ -1154,7 +1183,7 @@ class RealDagRenderTests(DagRenderCase):
     def test_licensed_assets_render_surfaces(self):
         rendering.render_video_result(self.result, self.video, self.output,
                                       mano_dir=os.environ["EGO_ANNO_MANO_DIR"])
-        source_pane, _ = self.panes(self.output, 0)
+        source_pane = self.panes(self.output, 0)[0]
         self.assertGreater(self.joint_pixels(source_pane), 0)
 
 
@@ -1201,9 +1230,9 @@ class RealSavedArtifactTests(DagRenderCase):
         """
         measured = []
         for frame_index in self.SAMPLES:
-            client_pane, client_world = self.panes(path, frame_index)
+            client_pane, client_world = self.panes(path, frame_index, layout="two-pane")
             self.assertGreater(self.joint_pixels(client_world), 0, "3D pane lost the hands")
-            server_pane, _ = self.panes(self.server, frame_index)
+            server_pane, _ = self.panes(self.server, frame_index, layout="two-pane")
             self.assertEqual(client_pane.shape, server_pane.shape)
             for color in HAND_COLORS:
                 mine = self.mask(client_pane, color)
@@ -1214,7 +1243,7 @@ class RealSavedArtifactTests(DagRenderCase):
         return measured
 
     def test_real_artifact_renders_the_documented_frame_count(self):
-        rendering.render_video_result(self.result, self.video, self.output)
+        rendering.render_video_result(self.result, self.video, self.output, layout="two-pane")
         stream = self.probe(self.output)
         self.assertEqual(stream["codec_name"], "h264")
         document = json.loads(self.result.read_text(encoding="utf-8"))
@@ -1223,7 +1252,7 @@ class RealSavedArtifactTests(DagRenderCase):
 
     def test_skeleton_render_lands_on_the_server_product(self):
         self.require_server_product()
-        rendering.render_video_result(self.result, self.video, self.output)
+        rendering.render_video_result(self.result, self.video, self.output, layout="two-pane")
         measured = self.coverage(self.output)
         self.assertEqual(len(measured), 2 * len(self.SAMPLES), measured)
         self.assertGreater(min(measured), 0.9, measured)
@@ -1233,11 +1262,251 @@ class RealSavedArtifactTests(DagRenderCase):
     def test_licensed_assets_reproduce_the_server_product(self):
         self.require_server_product()
         rendering.render_video_result(self.result, self.video, self.output,
-                                      mano_dir=os.environ["EGO_ANNO_MANO_DIR"])
+                                      mano_dir=os.environ["EGO_ANNO_MANO_DIR"], layout="two-pane")
         self.assertGreater(min(self.coverage(self.output)), 0.9)
-        _, world_pane = self.panes(self.output, 120)
+        _, world_pane = self.panes(self.output, 120, layout="two-pane")
         surfaces = int(self.mask(world_pane, self.SKIN, tolerance=120).sum())
         self.assertGreater(surfaces, 20000, "no MANO surfaces drawn in the 3D pane")
+
+
+def walking_reach_clip(count=60):
+    """Head poses and hands in the product world (first camera frame) plus world-up.
+
+    In a gravity frame (z up) the head yaws +-20 deg at a 25 deg forward-down pitch and
+    drifts; the left hand stays within reach except for an annotation gap, the right
+    hand moves out of reach for the last third of the clip.
+    """
+    import numpy as np
+    pitch = np.radians(25.0)
+    base = np.column_stack(((1.0, 0.0, 0.0),
+                            (0.0, -np.sin(pitch), -np.cos(pitch)),
+                            (0.0, np.cos(pitch), -np.sin(pitch))))
+    pattern = np.asarray([[0.012 * (k % 5 - 2), 0.02 * (k // 5), 0.004 * (k % 3)] for k in range(21)])
+    gravity_poses, hands = [], [np.full((count, 21, 3), np.nan), np.full((count, 21, 3), np.nan)]
+    for i in range(count):
+        yaw = np.radians(20.0) * np.sin(2 * np.pi * i / count)
+        rz = np.asarray(((np.cos(yaw), -np.sin(yaw), 0.0), (np.sin(yaw), np.cos(yaw), 0.0), (0.0, 0.0, 1.0)))
+        pose = np.eye(4)
+        pose[:3, :3] = rz @ base
+        pose[:3, 3] = (0.002 * i, 0.001 * i, 1.6 + 0.01 * np.sin(i / 7.0))
+        gravity_poses.append(pose)
+        R, C = pose[:3, :3], pose[:3, 3]
+        left = C + R @ np.asarray((-0.12 + 0.05 * np.sin(i / 5.0), 0.30, 0.40))
+        reach_right = 0.45 if i < 2 * count // 3 else 1.30
+        right = C + R @ np.asarray((0.14, 0.30, reach_right))
+        if not 20 <= i < 26:
+            hands[0][i] = left + pattern @ R.T
+        hands[1][i] = right + pattern @ R.T
+    first_inverse = np.linalg.inv(gravity_poses[0])
+    poses = np.asarray([first_inverse @ pose for pose in gravity_poses])
+    joints = [(rows.reshape(-1, 3) @ first_inverse[:3, :3].T + first_inverse[:3, 3]).reshape(count, 21, 3)
+              for rows in hands]
+    up = first_inverse[:3, :3] @ np.asarray((0.0, 0.0, 1.0))
+    return poses, joints, up
+
+
+class _CapturingWriter:
+    """cv2.VideoWriter stand-in that keeps every raw canvas (no codec in the loop)."""
+    frames = []
+
+    def __init__(self, *args, **kwargs):
+        type(self).frames = []
+
+    def isOpened(self):
+        return True
+
+    def write(self, frame):
+        type(self).frames.append(frame.copy())
+
+    def release(self):
+        pass
+
+
+@unittest.skipUnless(importlib.util.find_spec("numpy") is not None and importlib.util.find_spec("cv2") is not None,
+                     "numpy and cv2 (render extra) not installed")
+class BodyPaneTests(unittest.TestCase):
+    def setUp(self):
+        import numpy as np
+        self.np = np
+        self.body_pane = importlib.import_module("ego_anno.rendering.body_pane")
+        self.poses, self.joints, self.up = walking_reach_clip()
+        self.pane = self.body_pane.BodyPane(self.poses, np.ones(len(self.poses), bool), self.joints,
+                                            self.up, 30.0, (580, 914))
+
+    def test_three_pane_rectangles_are_equal_height_and_fill_the_width(self):
+        renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        self.assertEqual([w for _, _, w, _ in renderer._three_pane_layout(1920, 1080)["panes"]], [760, 580, 580])
+        for width, height in ((1920, 1080), (1280, 720), (3840, 2160), (640, 480), (1000, 1000)):
+            layout = renderer._three_pane_layout(width, height)
+            panes = layout["panes"]
+            self.assertEqual(len(panes), 3)
+            self.assertEqual({h for _, _, _, h in panes}, {height - layout["band"]})
+            self.assertEqual({y for _, y, _, _ in panes}, {0})
+            self.assertEqual(panes[0][0], 0)
+            for left, right in zip(panes, panes[1:]):
+                self.assertEqual(left[0] + left[2], right[0])
+            self.assertEqual(panes[-1][0] + panes[-1][2], width)
+
+    def test_observer_is_identical_on_every_frame(self):
+        view = self.pane.view_matrix.copy()
+        background = self.pane.raster.bg.copy()
+        for index in range(self.pane.n):
+            frame = self.pane.render(index, [self.joints[0][index], self.joints[1][index]])
+            self.assertEqual(frame.shape, (914, 580, 3))
+            self.assertTrue(self.np.array_equal(self.pane.view_matrix, view), index)
+        self.assertTrue(self.np.array_equal(self.pane.raster.bg, background))
+        # level observer: its right axis has no world-up component (no roll)
+        self.assertAlmostEqual(float(view[0, 2]), 0.0, places=12)
+
+    def test_bone_lengths_are_constant(self):
+        np = self.np
+        lengths = np.asarray([[np.linalg.norm(named[a] - named[b]) for a, b in self.body_pane.BONES]
+                              for named in (self.pane.body.named(i) for i in range(self.pane.n))])
+        self.assertLess(float((lengths.max(axis=0) - lengths.min(axis=0)).max()), 1e-4)
+        arm = self.body_pane.UPPER_ARM + self.body_pane.FOREARM
+        self.assertLessEqual(float(lengths[:, 9:13].reshape(-1, 2, 2).sum(axis=2).max()), arm + 1e-9)
+
+    def test_wrists_coincide_with_annotated_wrists_when_reachable(self):
+        np = self.np
+        body = self.pane.body
+        reachable = unreachable = 0
+        for side, name in enumerate(self.body_pane.SIDES):
+            for index in range(body.n):
+                wrist = self.joints[side][index][0]
+                if not np.isfinite(wrist).all():
+                    continue
+                target = self.pane.p(wrist)
+                joint = body.J[index]
+                distance = float(np.linalg.norm(target - joint["shoulder_" + name]))
+                gap = float(np.linalg.norm(joint["wrist_" + name] - target))
+                if distance <= self.body_pane.REACH:
+                    reachable += 1
+                    self.assertLess(gap, 1e-6, (name, index))
+                else:
+                    unreachable += 1
+                    self.assertGreater(gap, 0.0)
+        self.assertGreater(reachable, 60)
+        self.assertGreater(unreachable, 5, "fixture must exercise the out-of-reach dashed line")
+
+    def test_held_arm_and_pinned_head(self):
+        np = self.np
+        body = self.pane.body
+        self.assertTrue(np.allclose(body.J[22]["wrist_left"], body.J[19]["wrist_left"]))
+        for index in range(body.n):
+            self.assertTrue(np.allclose(body.J[index]["head"], self.pane.p(self.poses[index, :3, 3])))
+
+    def test_display_world_up_is_the_given_up(self):
+        np = self.np
+        self.assertTrue(np.allclose(self.pane.M[2], self.up / np.linalg.norm(self.up)))
+        self.assertTrue(np.allclose(self.pane.M @ self.pane.M.T, np.eye(3)))
+        self.assertAlmostEqual(float(np.linalg.det(self.pane.M)), 1.0)
+
+
+@unittest.skipUnless(importlib.util.find_spec("numpy") is not None and importlib.util.find_spec("cv2") is not None,
+                     "numpy and cv2 (render extra) not installed")
+class InProcessRendererTests(unittest.TestCase):
+    """Run the renderer's main() in-process with a capturing writer: raw canvases, no codec."""
+
+    def setUp(self):
+        if not shutil.which("ffmpeg"):
+            self.skipTest("fixture video requires system ffmpeg")
+        import numpy as np
+        self.np = np
+        self.cv2 = importlib.import_module("cv2")
+        self.renderer = importlib.import_module("ego_anno.rendering.render_ego_json_overlay")
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        poses, joints, _ = walking_reach_clip(count=8)
+        document = dag_document(count=8)
+        for index, entry in enumerate(document["逐帧轨迹"]):
+            frame = entry["帧{}".format(index + 1)]
+            frame["相机世界位姿"] = poses[index].tolist()
+            for key in ("手0", "手1"):          # measured skeletons: no MANO assets needed
+                frame[key]["beta参数"] = None
+        self.result = self.root / "annotation.json"
+        self.result.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+        self.video = self.root / "clip.mp4"
+        completed = subprocess.run(
+            [shutil.which("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+             "-i", "testsrc2=s=640x480:r=15", "-frames:v", "8", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             str(self.video)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        if "Unknown encoder" in completed.stderr:
+            self.skipTest("system ffmpeg lacks libx264")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def run_main(self, module, *extra):
+        argv = ["render_ego_json_overlay.py", str(self.result), "--video", str(self.video),
+                "-o", str(self.root / "unused.mp4"), "--fps", "15", *extra]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(self.cv2, "VideoWriter", _CapturingWriter), \
+                mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
+            self.assertEqual(module.main(), 0)
+        return list(_CapturingWriter.frames)
+
+    def test_default_canvas_is_three_panes_at_1920x1080(self):
+        frames = self.run_main(self.renderer)
+        self.assertEqual(len(frames), 8)
+        frame = frames[3]
+        self.assertEqual(frame.shape, (1080, 1920, 3))
+        panes = self.renderer._three_pane_layout(1920, 1080)["panes"]
+        for x, _, _, h in panes[1:]:                       # separators between panes
+            self.assertTrue((frame[60:h, x - 1:x + 1] == 60).all())
+        overlay, world, body = (frame[y:y + h, x:x + w] for x, y, w, h in panes)
+        self.assertGreater(int((abs(body.astype(int) - (50, 110, 240)).sum(axis=2) < 90).sum()), 20)
+        self.assertEqual(int(body[-5:, 5:-5].max()), 0, "skeleton pane background is black")
+        self.assertGreater(float(world[..., 1].mean()), float(world[..., 0].mean()), "follow pane is green")
+
+    def test_skeleton_up_is_the_follow_view_up(self):
+        np = self.np
+        captured = {}
+        follow = self.renderer._follow_view_track
+        module = self.renderer._body_pane_module()
+
+        def track(*args, **kwargs):
+            views, report = follow(*args, **kwargs)
+            captured["follow"] = report["up"]
+            return views, report
+
+        class Pane(module.BodyPane):
+            def __init__(self, poses, pose_valid, joints, up, fps, size):
+                captured["body"] = np.asarray(up)
+                super().__init__(poses, pose_valid, joints, up, fps, size)
+                captured["display_up"] = self.M[2]
+
+        for extra in ((), ("--world-up", "0.1,-0.9,-0.4")):
+            captured.clear()
+            with mock.patch.object(self.renderer, "_follow_view_track", side_effect=track), \
+                    mock.patch.object(module, "BodyPane", Pane):
+                self.run_main(self.renderer, *extra)
+            self.assertTrue(np.array_equal(captured["body"], captured["follow"]), extra)
+            self.assertTrue(np.allclose(captured["display_up"], captured["follow"]), extra)
+            if extra:
+                given = np.asarray((0.1, -0.9, -0.4))
+                self.assertTrue(np.allclose(captured["follow"], given / np.linalg.norm(given)))
+
+    def test_two_pane_canvas_is_unchanged_from_e55ff01(self):
+        """Pixel-compare --layout two-pane against the renderer as of commit e55ff01."""
+        repository = Path(__file__).resolve().parents[1]
+        git = shutil.which("git")
+        if git is None:
+            self.skipTest("git is required to load the e55ff01 renderer")
+        completed = subprocess.run([git, "-C", str(repository), "show",
+                                    "e55ff01:src/ego_anno/rendering/render_ego_json_overlay.py"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if completed.returncode:
+            self.skipTest("commit e55ff01 is not available in this checkout")
+        old_path = self.root / "render_ego_json_overlay_e55ff01.py"
+        old_path.write_bytes(completed.stdout)
+        spec = importlib.util.spec_from_file_location("render_ego_json_overlay_e55ff01", old_path)
+        old = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(old)
+        before = self.run_main(old)
+        after = self.run_main(self.renderer, "--layout", "two-pane")
+        self.assertEqual(len(before), len(after))
+        for index, (a, b) in enumerate(zip(before, after)):
+            self.assertEqual(a.shape, (480, 640, 3))
+            self.assertTrue(self.np.array_equal(a, b), "frame {} differs".format(index))
 
 
 if __name__ == "__main__":

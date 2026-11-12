@@ -32,6 +32,12 @@ COSMOS_HEAD_SCHEMA = "cosmos-e2e-result/v2"
 COSMOS_SCHEMAS = (COSMOS_SCHEMA, COSMOS_HEAD_SCHEMA)
 SUPPORTED_SCHEMAS = COSMOS_SCHEMAS + (DAG_SCHEMA,)
 
+# Output layouts. three-pane (overlay | follow view | upper-body skeleton) is the
+# product layout and defaults to 1920x1080; two-pane keeps the earlier output at
+# the source size.
+LAYOUTS = ("three-pane", "two-pane")
+THREE_PANE_SIZE = [1920, 1080]
+
 # The DAG writes one 手0/手1 entry per frame; MANO shape parameters live here.
 HAND_KEYS = ("手0", "手1")
 SHAPE_KEY = "beta参数"
@@ -98,6 +104,16 @@ def _check_output_dimensions(width, height, fallback):
     return output_size
 
 
+def _layout_argument(layout):
+    if layout not in LAYOUTS:
+        raise ClientError("--layout must be one of {}".format(", ".join(LAYOUTS)))
+    return ["--layout", layout]
+
+
+def _default_size(layout, source_size):
+    return list(THREE_PANE_SIZE) if layout == "three-pane" else source_size
+
+
 def _load_video_dependency():
     try:
         importlib.import_module("numpy")
@@ -157,15 +173,18 @@ def _encode_renderer_output(result_path, video_path, camera_path, destination, w
         os.replace(str(encoded), str(destination))
 
 
-def render_result(result, inputs, output, width=None, height=None):
+def render_result(result, inputs, output, width=None, height=None, layout="three-pane"):
     """Render a saved e2e bundle and atomically publish a browser-playable MP4.
 
     ``inputs`` is the directory written by ``submit --save-inputs``. Its video
     must be the exact uploaded bytes; no frame resampling or calibration/shape
-    estimation occurs. Returns the destination ``Path``. No API key or network
-    connection is used, and an existing destination survives every failure.
+    estimation occurs. ``layout`` is ``"three-pane"`` (default, 1920x1080) or
+    ``"two-pane"`` (source size). Returns the destination ``Path``. No API key
+    or network connection is used, and an existing destination survives every
+    failure.
     """
     try:
+        layout_flag = _layout_argument(layout)
         result_path = Path(result).expanduser().resolve()
         inputs_path = Path(inputs).expanduser().resolve()
         destination = Path(output).expanduser().resolve()
@@ -183,7 +202,7 @@ def render_result(result, inputs, output, width=None, height=None):
         expected_size = _validate_submission(submission, document, camera)
         if not video_path.is_file():
             raise ClientError("saved processed input video does not exist: {}".format(video_path))
-        output_size = _check_output_dimensions(width, height, expected_size)
+        output_size = _check_output_dimensions(width, height, _default_size(layout, expected_size))
         if shutil.which("ffmpeg") is None:
             raise ClientError("offline rendering requires system ffmpeg with the libx264 encoder on PATH")
         cv2 = _load_video_dependency()
@@ -200,7 +219,7 @@ def render_result(result, inputs, output, width=None, height=None):
             capture.release()
         _encode_renderer_output(result_path, video_path,
                                camera_path if camera is not None else None,
-                                destination, output_size[0], output_size[1], [])
+                                destination, output_size[0], output_size[1], layout_flag)
         return destination
     except ClientError:
         raise
@@ -335,7 +354,7 @@ def _world_up_argument(world_up):
 
 
 def render_video_result(result, video, output, width=None, height=None, camera=None, fps=None,
-                        mano_dir=None, world_up=None):
+                        mano_dir=None, world_up=None, layout="three-pane"):
     """Render a downloaded result against the exact video the job consumed.
 
     Supported results are the DAG ``ego.annotation.product_json.v3`` document
@@ -349,11 +368,16 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
     skeletons the result carries and prints that limitation. ``world_up`` is an
     optional gravity-up direction ``(x, y, z)`` in the result's world frame
     (the first camera frame); when omitted the 3D pane estimates it from the
-    camera trajectory. Returns the destination ``Path``; no API key or network
-    connection is used, and an existing destination survives every failure.
+    camera trajectory; both 3D panes use the same up vector. ``layout`` is
+    ``"three-pane"`` (default: hand overlay | side-rear follow view | upper-body
+    skeleton, 1920x1080) or ``"two-pane"`` (the first two panes at the source
+    size); ``width``/``height`` rescale either layout proportionally. Returns
+    the destination ``Path``; no API key or network connection is used, and an
+    existing destination survives every failure.
     """
     temporary = None
     try:
+        layout_flag = _layout_argument(layout)
         result_path = Path(result).expanduser().resolve()
         video_path = Path(video).expanduser().resolve()
         destination = Path(output).expanduser().resolve()
@@ -392,12 +416,13 @@ def render_video_result(result, video, output, width=None, height=None, camera=N
                 extra = ["--fps", "{:g}".format(_validate_dag_video(cv2, capture, count, fps))]
             elif fps is not None:
                 raise ClientError("--fps is fixed by the cosmos-e2e-result metadata; omit it")
-            output_size = _check_output_dimensions(width, height, source_size)
+            output_size = _check_output_dimensions(width, height, _default_size(layout, source_size))
         finally:
             capture.release()
         if assets is not None:
             extra.extend(["--mano-dir", str(assets)])
         extra.extend(world_up_flag)
+        extra.extend(layout_flag)
         prepared = result_path
         if schema == DAG_SCHEMA and assets is None:
             print("notice: the licensed MANO hand model is not distributed with this client; "

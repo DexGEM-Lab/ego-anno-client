@@ -62,6 +62,9 @@ def main(argv=None):
         render.add_argument("--fps", type=float, help="DAG only: source frame rate when it cannot be probed")
         render.add_argument("--world-up", metavar="X,Y,Z",
                             help="gravity-up direction in the result's world frame; estimated when omitted")
+        render.add_argument("--layout", choices=("three-pane", "two-pane"), default="three-pane",
+                            help="three-pane (default, 1920x1080): overlay | follow view | upper-body "
+                                 "skeleton; two-pane: overlay | follow view at the source size")
         render.add_argument("-o", "--output", required=True, help="output H.264 MP4")
         render.add_argument("--width", type=int)
         render.add_argument("--height", type=int)
@@ -90,12 +93,12 @@ def main(argv=None):
                     if getattr(args, name) is not None:
                         parser.error("--{} applies only to the --video form".format(name.replace("_", "-")))
                 output = render_result(args.result, args.inputs, args.output,
-                                       args.width, args.height)
+                                       args.width, args.height, layout=args.layout)
             else:
                 output = render_video_result(args.result, args.video, args.output,
                                              width=args.width, height=args.height,
                                              camera=args.camera, fps=args.fps, mano_dir=args.mano_dir,
-                                             world_up=args.world_up)
+                                             world_up=args.world_up, layout=args.layout)
             print("Rendered {}".format(output))
             return 0
         key = os.environ.get("EGO_ANNO_API_KEY") or getpass.getpass("API key: ")

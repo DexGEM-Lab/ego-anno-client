@@ -277,14 +277,21 @@ count differs from `Metadata.帧数`, and `--fps` must agree with the video's ow
 frame rate when you supply it (it is only needed when the container reports no
 frame rate).
 
-The preview is the same two-pane layout the server produces: the source video
-with the measured joint skeletons overlaid, and a 3D pane with the camera
-trajectory and hands, above a subtitle band. The 3D pane is a level side-rear
-observer that follows the camera and hands slowly: world-up is estimated from
-the camera trajectory (the result's world frame is the first camera frame and
-carries no gravity), and `--world-up X,Y,Z` supplies it instead when the source
-recording's gravity is known. Optional `--width`/`--height` change only the
-layout, never the calibration.
+The preview is the same three-pane layout the server produces, 1920x1080 by
+default, for both `dag` and `e2e` results: the source video with the measured
+joint skeletons overlaid (a fixed crop centred on the hands), a 3D pane with
+the camera trajectory and hands, and an upper-body skeleton pane, side by side
+above one subtitle band. The 3D pane is a level side-rear observer that follows
+the camera and hands slowly. The skeleton pane is seen by one static
+front-oblique observer: the head is the camera, the wrists sit on the annotated
+wrists, and a stick upper body (constant bone lengths, pelvis hanging below the
+shoulders) is inferred from them; an arm that cannot reach its hand shows a
+dashed line instead of a stretched bone. Both 3D panes use one world-up,
+estimated from the camera trajectory (the result's world frame is the first
+camera frame and carries no gravity); `--world-up X,Y,Z` supplies it instead
+when the source recording's gravity is known. `--layout two-pane` renders the
+earlier overlay + 3D layout at the source size. Optional `--width`/`--height`
+scale the panes proportionally and never change the calibration.
 
 MANO hand surfaces require the licensed MANO model, which is not distributed
 with this client. Without `--mano-dir` the render draws the measured 21-joint
